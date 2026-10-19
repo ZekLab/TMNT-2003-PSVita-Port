@@ -1,0 +1,18 @@
+# Game data and anything derived from the executable stay local.
+/game/
+/installer/
+/recomp/out/
+/build/
+# Local tools and references (see INSTALLED.md and README.md).
+/wineprefix/
+/tools/wine/
+/ref/
+/.venv/
+__pycache__/
+# Run outputs.
+/logs/
+*.log
+*.wav
+*.pid
+# Unused copy of the repentogxm runtime.
+/rt/guest.c
