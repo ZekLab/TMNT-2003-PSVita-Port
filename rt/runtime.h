@@ -5,7 +5,12 @@
 #include <stdint.h>
 #include "guest.h"
 
+/* The Vita has no room for 512 MB: a level keeps ~65 MB of guest heap in use. */
+#ifdef __vita__
+#define GUEST_SPACE (192U << 20)
+#else
 #define GUEST_SPACE (512U << 20)
+#endif
 #define GUEST_TEB 0x00010000U
 #define GUEST_PEB 0x00011000U
 #define GUEST_SCRATCH 0x00012000U
@@ -35,9 +40,10 @@ uint32_t rt_add_thunk(const rt_thunk *t);
 void rt_thunk_call(CPU *__restrict c, uint32_t addr);
 const rt_thunk *rt_find_import(const char *name);
 void rt_win32_init(CPU *__restrict c);
-uint32_t rt_current_teb(void);
-void rt_safepoint(void);
-uint32_t rt_current_tid(void);
+uint32_t rt_current_teb(CPU *__restrict c);
+void rt_safepoint(CPU *__restrict c, const rt_thunk *t);
+const rt_thunk *rt_current_thunk(CPU *__restrict c);
+uint32_t rt_current_tid(CPU *__restrict c);
 uint32_t rt_call_guest(CPU *__restrict c, uint32_t fn, int nargs, const uint32_t *args);
 
 uint32_t rt_alloc(uint32_t n);
@@ -45,5 +51,7 @@ void rt_free(uint32_t p);
 uint32_t rt_realloc(uint32_t p, uint32_t n);
 uint32_t rt_alloc_size(uint32_t p);
 uint32_t rt_heap_used(void);
+uint32_t rt_heap_live(void);
+void rt_prof_report(uint32_t frames);
 
 #endif

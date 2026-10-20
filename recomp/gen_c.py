@@ -14,17 +14,28 @@ CHUNK = 200
 HOOKS = {
     0x011d93: "tmnt_hook_start_area",
     0x0047d7: "tmnt_hook_set_next_area",
+    0x098466: "tmnt_hook_title",
+}
+
+# Host fast paths tried at the entry of a translated function (before its body): a nonzero return means the host did the work
+# (registers and the `ret` included), zero runs the translated body as usual. RVA -> host function name, in rt/game_hooks.h.
+FASTPATHS = {
+    0x16abe9: "tmnt_fast_getptd",   # CRT _getptd: ~2300 calls a frame in fights, three API calls each
+    0x0b3354: "tmnt_fast_ticks",    # elapsed rdtsc ticks: ~14500 calls a frame in fights, through two more translated calls
 }
 
 OVERRIDES = {
-    0x1630a0: ("CPU probe: report no SSE (the CRI ADX SSE decoder also uses MMX)", ["c->eax = 0;", "(void)GPOP();"]),
-    0x163110: ("CPU probe: report no MMX", ["c->eax = 0;", "(void)GPOP();"]),
+    # Bodies use the CPU fields directly (no GUEST_GPR_DECL), so they hold in both register modes; `c->esp += 4` is the `ret`.
+    0x1630a0: ("CPU probe: report no SSE (the CRI ADX SSE decoder also uses MMX)", ["c->eax = 0;", "c->esp += 4U;"]),
+    0x163110: ("CPU probe: report no MMX", ["c->eax = 0;", "c->esp += 4U;"]),
 }
 
 
 def function_lines(em, body, order, start, name):
     L = ["void %s(CPU *__restrict c)" % name, "{"]
     L.append("    GUEST_ENTER(0x%08xU);" % start)
+    if start in FASTPATHS:
+        L.append("    if (%s(c)) return;" % FASTPATHS[start])
     if start in HOOKS:
         L.append("    %s(c);" % HOOKS[start])
     L.extend("    %s" % line for line in B.flag_state_prologue(em))
@@ -65,8 +76,11 @@ def main():
         L.extend("void sub_%08x(CPU *__restrict c);" % t for t in sorted(decls | {f["rva"] for f in part}))
         L.append("")
         L.extend(bodies)
-        with open(os.path.join(cdir, "guest_%03d.c" % (n // CHUNK)), "w") as f:
-            f.write("\n".join(L) + "\n")
+        # Unchanged files keep their timestamps, so a rebuild only recompiles what changed (the Vita build takes ~10 minutes).
+        path, text = os.path.join(cdir, "guest_%03d.c" % (n // CHUNK)), "\n".join(L) + "\n"
+        if not os.path.exists(path) or open(path).read() != text:
+            with open(path, "w") as f:
+                f.write(text)
     print("files:", (len(funcs) + CHUNK - 1) // CHUNK)
 
 

@@ -2,7 +2,7 @@
 GEN := recomp/out/c
 OBJ := build/mac/obj
 CC := clang
-GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0
+GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 -DGUEST_GPR_LOCAL=1
 RTFLAGS := -O1 -g -Wall -Wno-unused-function -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 $(shell sdl2-config --cflags)
 
 GEN_SRC := $(wildcard $(GEN)/guest_*.c) $(GEN)/dispatch.c $(GEN)/imports.c

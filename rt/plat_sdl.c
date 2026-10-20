@@ -11,6 +11,7 @@
 static SDL_Window *window;
 static SDL_GLContext glctx;
 static int win_w, win_h;
+static int game_w, game_h;   /* the size the game asked for; Win32 reports this one */
 static uint8_t dik[256];
 static SDL_GameController *pad;
 
@@ -68,9 +69,14 @@ int plat_video_init(int width, int height)
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    win_w = width;
-    win_h = height;
-    window = SDL_CreateWindow("TMNT (translated)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, SDL_WINDOW_OPENGL);
+    game_w = win_w = width;
+    game_h = win_h = height;
+    /* TMNT_WINDOW=WxH: a window of another size, e.g. 960x544 to preview the Vita screen. */
+    const char *ws = getenv("TMNT_WINDOW");
+    if (ws && sscanf(ws, "%dx%d", &win_w, &win_h) != 2) { win_w = width; win_h = height; }
+    /* TMNT_HIDDEN=1: no visible window (automated test runs); rendering and screenshots still work. */
+    Uint32 wflags = SDL_WINDOW_OPENGL | (getenv("TMNT_HIDDEN") && atoi(getenv("TMNT_HIDDEN")) ? SDL_WINDOW_HIDDEN : 0);
+    window = SDL_CreateWindow("TMNT (translated)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, wflags);
     if (!window) {
         rt_log("[plat] SDL_CreateWindow: %s\n", SDL_GetError());
         return 0;
@@ -81,7 +87,7 @@ int plat_video_init(int width, int height)
         return 0;
     }
     SDL_GL_SetSwapInterval(getenv("TMNT_VSYNC") ? 1 : 0);
-    rt_log("[plat] GL %s / %s, window %dx%d\n", glGetString(GL_VERSION), glGetString(GL_RENDERER), width, height);
+    rt_log("[plat] GL %s / %s, window %dx%d\n", glGetString(GL_VERSION), glGetString(GL_RENDERER), win_w, win_h);
     for (int i = 0; i < SDL_NumJoysticks(); i++)
         if (SDL_IsGameController(i) && (pad = SDL_GameControllerOpen(i)) != NULL)
             break;
@@ -92,6 +98,12 @@ void plat_screen_size(int *w, int *h)
 {
     *w = win_w;
     *h = win_h;
+}
+
+void plat_game_size(int *w, int *h)
+{
+    *w = game_w;
+    *h = game_h;
 }
 
 void plat_swap(void)

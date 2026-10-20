@@ -21,6 +21,8 @@ const uint8_t *plat_dik_state(void);
 /* Pad: buttons as a DirectInput joystick (bit n = button n), axes -1000..1000. */
 void plat_pad(uint32_t *buttons, int32_t axes[4], int *pov);
 void plat_screen_size(int *w, int *h);
+/* The resolution the game asked for (Win32 client rectangle); the screen may differ. */
+void plat_game_size(int *w, int *h);
 /* Writes the current back buffer as a PNG. */
 void plat_screenshot(const char *path);
 void plat_write_rgba_png(const char *path, const uint8_t *rgba, int w, int h);

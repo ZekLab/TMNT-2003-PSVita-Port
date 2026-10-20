@@ -19,11 +19,9 @@ static uint32_t com_unimplemented(CPU *__restrict c);
 
 typedef struct { rt_thunk thunk; char name[96]; int warned; } com_thunk;
 
-extern __thread const rt_thunk *rt_cur_thunk;
-
 static uint32_t com_unimplemented(CPU *__restrict c)
 {
-    com_thunk *t = (com_thunk *)rt_cur_thunk;
+    com_thunk *t = (com_thunk *)rt_current_thunk(c);
     if (!t->warned) {
         t->warned = 1;
         rt_log("[com] unimplemented %s (this %08x, %08x, %08x, %08x)\n", t->name, ARG(0), ARG(1), ARG(2), ARG(3));

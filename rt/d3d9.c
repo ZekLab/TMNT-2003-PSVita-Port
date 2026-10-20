@@ -11,6 +11,9 @@
 #define D3DERR_INVALIDCALL 0x8876086CU
 
 static d3d_device *device;
+/* Live guest-memory bytes held by textures and buffers, for the memory budget. */
+uint64_t d3d_tex_bytes, d3d_buf_bytes;
+uint32_t d3d_tex_count;
 static uint32_t d3d_object;
 static int trace_d3d;
 
@@ -196,7 +199,9 @@ static uint32_t t_Release(CPU *c)
     if (t->refs == 0 && !getenv("TMNT_KEEP_TEXTURES")) {
         /* The game may release on a loader thread: GL names are deleted on the render thread at the next Present. */
         if (t->gl) gl_defer_delete(t->gl);
+        d3d_tex_count--;
         for (uint32_t l = 0; l < t->levels; l++) {
+            d3d_tex_bytes -= t->bytes[l];
             rt_free(t->mem[l]);
             if (t->surf[l]) { com_forget(t->surf[l]->guest); free(t->surf[l]); }
         }
@@ -231,8 +236,10 @@ static d3d_tex *texture_new(uint32_t w, uint32_t h, uint32_t levels, uint32_t us
     }
     if (levels > MAX_LEVELS) levels = MAX_LEVELS;
     t->w = w; t->h = h; t->levels = levels; t->usage = usage; t->fmt = fmt; t->pool = pool;
+    d3d_tex_count++;
     for (uint32_t l = 0; l < levels; l++) {
         level_layout(fmt, mipw(w, (int)l), mipw(h, (int)l), &t->pitch[l], &t->bytes[l]);
+        d3d_tex_bytes += t->bytes[l];
         t->mem[l] = rt_alloc(t->bytes[l]);
         memset(G2H(t->mem[l]), 0, t->bytes[l]);
     }
@@ -271,6 +278,7 @@ static uint32_t b_Release(CPU *c)
     if (b->refs == 0) {
         for (int s = 0; s < 4; s++) if (device && device->stream[s].vb == b) device->stream[s].vb = NULL;
         if (device && device->ib == b) device->ib = NULL;
+        d3d_buf_bytes -= b->size;
         rt_free(b->mem);
         com_forget(b->guest);
         free(b);
@@ -298,6 +306,7 @@ static d3d_buf *buf_new(int index, uint32_t size, uint32_t usage, uint32_t fvf_o
     b->size = size; b->usage = usage; b->pool = pool;
     if (index) b->fmt = fvf_or_fmt; else b->fvf = fvf_or_fmt;
     b->mem = rt_alloc(size ? size : 4);
+    d3d_buf_bytes += size;
     memset(G2H(b->mem), 0, size);
     b->guest = com_new(buf_vtbl(index), 16, b);
     return b;

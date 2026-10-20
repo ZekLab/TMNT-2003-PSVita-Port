@@ -4,11 +4,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#include <psp2/kernel/sysmem.h>
+#include <psp2/power.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include "guest.h"
+#include "osdep.h"
 #include "runtime.h"
 
 uint8_t *guest_membase;
@@ -24,7 +31,6 @@ typedef struct { uint32_t slot_rva; const char *name; } guest_import_slot;
 extern const guest_import_slot guest_import_slots[];
 extern const uint32_t guest_import_count;
 
-__thread const rt_thunk *rt_cur_thunk;
 static pthread_mutex_t heap_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static int trace_imports;
 
@@ -85,17 +91,47 @@ void guest_xgetbv(CPU *__restrict c)
     c->eax = 0; c->edx = 0;
 }
 
+static uint32_t prof_rdtsc;
+/* rdtsc at a nominal 500 MHz. The game reads it thousands of times a frame; on the Vita the 32-bit process clock is the cheapest
+ * (~0.4 us against ~1 us for the 64-bit one), extended here by counting wraps (every 71 minutes). */
+#ifdef __vita__
+/* The game reads rdtsc 7-10k times a frame in fights; even the cheapest system clock call made that ~10% of the frame. A thread
+ * on cores 1-2 refreshes a 32-bit microsecond copy every 100 us and readers only load it (wraps are counted, every 71 minutes);
+ * each read still advances by at least one tick, so time never stands still for code that measures short spans. */
+static volatile uint32_t rdtsc_cache_lo;
+static void *rdtsc_ticker(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(0, 15);
+    for (;;) {
+        rdtsc_cache_lo = sceKernelGetProcessTimeLow();
+        sceKernelDelayThread(100);
+    }
+    return NULL;
+}
+#endif
+
 uint64_t guest_rdtsc(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 500000000ULL + (uint64_t)ts.tv_nsec / 2U;
+    prof_rdtsc++;
+#ifdef __vita__
+    static uint32_t last_lo, hi;
+    static uint64_t last;
+    uint32_t lo = rdtsc_cache_lo;
+    if (lo < last_lo) hi++;
+    last_lo = lo;
+    uint64_t t = (((uint64_t)hi << 32) | lo) * 500U;
+    if (t <= last) t = last + 1U;
+    last = t;
+    return t;
+#else
+    return rt_now_us() * 500U;
+#endif
 }
 
 uint32_t guest_fs_base(CPU *__restrict c)
 {
-    (void)c;
-    return rt_current_teb();
+    return rt_current_teb(c);
 }
 
 /* ------------------------------------------------------------- tracing --- */
@@ -103,6 +139,20 @@ uint32_t guest_fs_base(CPU *__restrict c)
 volatile int guest_trace_on;
 static uint32_t trace_rvas[64];
 static int trace_count;
+static int watch_functions;
+
+/* TMNT_PROF=1: where the main thread's time goes, reported with the frame line (rt_prof_report). Host API time per import/COM
+ * method, and a sampling profile of the translated function the main thread last entered (sampled every 500 us on another core). */
+static int prof_on;
+static CPU *prof_cpu;
+static volatile uint32_t prof_cur_fn;
+static uint64_t prof_thunk_us[RT_MAX_THUNKS];
+static uint32_t prof_thunk_n[RT_MAX_THUNKS];
+#define PROF_SLOTS 8192
+static uint32_t prof_fn_rva[PROF_SLOTS], prof_fn_hits[PROF_SLOTS], prof_samples;
+void rt_note_function(CPU *c, uint32_t rva);
+void rt_note_import(CPU *c, const char *name, int stage);
+extern int rt_watchdog_on;
 
 static void trace_init(void)
 {
@@ -112,14 +162,18 @@ static void trace_init(void)
         trace_rvas[trace_count++] = v >= GUEST_IMAGE_BASE ? v - GUEST_IMAGE_BASE : v;
         while (*s == ',' || *s == ' ') s++;
     }
-    guest_trace_on = trace_count > 0;
+    watch_functions = getenv("TMNT_WATCHDOG") && atoi(getenv("TMNT_WATCHDOG"));
+    prof_on = getenv("TMNT_PROF") && atoi(getenv("TMNT_PROF"));
+    guest_trace_on = trace_count > 0 || watch_functions || prof_on;
 }
 
 void guest_trace_enter(CPU *c, uint32_t rva)
 {
+    if (prof_on && c == prof_cpu) prof_cur_fn = rva;
+    if (watch_functions) rt_note_function(c, rva);
     for (int i = 0; i < trace_count; i++) {
         if (trace_rvas[i] == rva) {
-            rt_log("[call:%u] %08x(%08x, %08x, %08x, %08x) eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x from %08x\n", rt_current_tid(), rva + GUEST_IMAGE_BASE,
+            rt_log("[call:%u] %08x(%08x, %08x, %08x, %08x) eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x from %08x\n", rt_current_tid(c), rva + GUEST_IMAGE_BASE,
                    ld32(c->esp + 4), ld32(c->esp + 8), ld32(c->esp + 12), ld32(c->esp + 16), c->eax, c->ebx, c->ecx, c->edx, c->esi, c->edi, ld32(c->esp));
             for (int k = 0; k < 2; k++) {
                 uint32_t a = ld32(c->esp + 4U + 4U * (uint32_t)k);
@@ -239,8 +293,16 @@ static guest_fn lookup(uint32_t rva)
 }
 
 #define CALLSTACK_DEPTH 64
+/* Last indirect calls, for fault reports. On the Vita __thread is emulated (a library call per access), so it is shared there. */
+#ifdef __vita__
+static uint32_t callstack[CALLSTACK_DEPTH];
+static int callstack_top;
+#else
 static __thread uint32_t callstack[CALLSTACK_DEPTH];
 static __thread int callstack_top;
+#endif
+
+uint32_t rt_last_guest_call(void) { return callstack[(callstack_top - 1) & (CALLSTACK_DEPTH - 1)]; }
 
 void rt_backtrace(CPU *__restrict c)
 {
@@ -291,19 +353,73 @@ void rt_thunk_call(CPU *__restrict c, uint32_t addr)
         return;
     }
     const rt_thunk *t = thunks[i];
+    if (rt_watchdog_on) rt_note_import(c, t->name, 1);
     if (t->fn == NULL) {
         char what[160];
         snprintf(what, sizeof what, "unimplemented import %s", t->name);
         guest_fault(c, addr, what);
         return;
     }
-    rt_cur_thunk = t;
-    rt_safepoint();
+    rt_safepoint(c, t);
+    if (rt_watchdog_on) rt_note_import(c, t->name, 2);
     if (trace_imports)
-        rt_log("[imp:%u] %s(%08x, %08x, %08x, %08x) from %08x\n", rt_current_tid(), t->name, ARG(0), ARG(1), ARG(2), ARG(3), ld32(c->esp));
-    uint32_t ret = t->fn(c);
+        rt_log("[imp:%u] %s(%08x, %08x, %08x, %08x) from %08x\n", rt_current_tid(c), t->name, ARG(0), ARG(1), ARG(2), ARG(3), ld32(c->esp));
+    uint32_t ret;
+    if (prof_on && c == prof_cpu) {
+        uint64_t t0 = rt_now_us();
+        ret = t->fn(c);
+        prof_thunk_us[i] += rt_now_us() - t0;
+        prof_thunk_n[i]++;
+    } else {
+        ret = t->fn(c);
+    }
+    if (rt_watchdog_on) rt_note_import(c, t->name, 3);
     c->eax = ret;
     c->esp += 4U + 4U * (uint32_t)t->nargs;
+}
+
+static void *prof_sampler(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(0, 15);
+    for (;;) {
+        rt_sleep_us(500);
+        uint32_t rva = prof_cur_fn, h = (rva * 2654435761U) >> 19;
+        for (uint32_t k = 0; k < PROF_SLOTS; k++, h = (h + 1) & (PROF_SLOTS - 1)) {
+            if (prof_fn_rva[h] == rva || prof_fn_hits[h] == 0) { prof_fn_rva[h] = rva; prof_fn_hits[h]++; break; }
+        }
+        prof_samples++;
+    }
+    return NULL;
+}
+
+/* Logs the heaviest host API calls (per frame over `frames`) and translated functions, then starts a new window. */
+void rt_prof_report(uint32_t frames)
+{
+    if (!prof_on || !frames) return;
+    for (int r = 0; r < 10; r++) {
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < thunk_count; i++) if (prof_thunk_us[i] > prof_thunk_us[best]) best = i;
+        if (!prof_thunk_us[best]) break;
+        rt_log("[prof] api %-40s %6.2f ms/frame, %5u calls/frame\n", thunks[best]->name, (double)prof_thunk_us[best] / frames / 1000.0,
+               prof_thunk_n[best] / frames);
+        prof_thunk_us[best] = 0;
+    }
+    rt_log("[prof] rdtsc %u/frame\n", prof_rdtsc / frames);
+    prof_rdtsc = 0;
+    memset(prof_thunk_us, 0, sizeof prof_thunk_us);
+    memset(prof_thunk_n, 0, sizeof prof_thunk_n);
+    uint32_t total = prof_samples;
+    for (int r = 0; r < 15 && total; r++) {
+        uint32_t best = 0;
+        for (uint32_t h = 1; h < PROF_SLOTS; h++) if (prof_fn_hits[h] > prof_fn_hits[best]) best = h;
+        if (!prof_fn_hits[best]) break;
+        rt_log("[prof] fn %08x %5.1f%%\n", prof_fn_rva[best] + GUEST_IMAGE_BASE, 100.0 * prof_fn_hits[best] / total);
+        prof_fn_hits[best] = 0;
+    }
+    memset(prof_fn_rva, 0, sizeof prof_fn_rva);
+    memset(prof_fn_hits, 0, sizeof prof_fn_hits);
+    prof_samples = 0;
 }
 
 /* ---------------------------------------------------------- guest heap --- */
@@ -413,10 +529,13 @@ uint32_t rt_alloc_size(uint32_t p)
     return p ? bsize(p - HDR) - HDR : 0;
 }
 
+static uint64_t heap_live;
+
 uint32_t rt_alloc(uint32_t n)
 {
     pthread_mutex_lock(&heap_lock);
     uint32_t p = heap_alloc(n);
+    if (p) heap_live += bsize(p - HDR);
     pthread_mutex_unlock(&heap_lock);
     return p;
 }
@@ -424,6 +543,7 @@ uint32_t rt_alloc(uint32_t n)
 void rt_free(uint32_t p)
 {
     pthread_mutex_lock(&heap_lock);
+    if (p) heap_live -= bsize(p - HDR);
     heap_free(p);
     pthread_mutex_unlock(&heap_lock);
 }
@@ -442,6 +562,7 @@ uint32_t rt_realloc(uint32_t p, uint32_t n)
 }
 
 uint32_t rt_heap_used(void) { return heap_top - heap_lo; }
+uint32_t rt_heap_live(void) { return (uint32_t)heap_live; }
 
 /* -------------------------------------------------------------- loader --- */
 
@@ -498,7 +619,47 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx)
 }
 #endif
 
-int main(int argc, char **argv)
+#ifdef __vita__
+/* Newlib heap for host allocations; the guest space is its own memory block. */
+int _newlib_heap_size_user = 48 * 1024 * 1024;
+#define VITA_DATA_DIR "ux0:data/TMNT2003"
+/* Translated code nests every guest call on the native stack: the game runs on a thread with a large one. */
+#define VITA_GAME_STACK (8U << 20)
+
+static void *alloc_guest_space(void)
+{
+    SceUID b = sceKernelAllocMemBlock("tmnt_guest", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GUEST_SPACE, NULL);
+    void *m = NULL;
+    if (b < 0 || sceKernelGetMemBlockBase(b, &m) < 0) return NULL;
+    return m;
+}
+
+/* tmnt_env.txt in the data folder: NAME=value lines, the Vita's stand-in for environment variables. */
+static void load_env_file(void)
+{
+    FILE *f = fopen("tmnt_env.txt", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+    }
+    fclose(f);
+}
+#else
+static void *alloc_guest_space(void)
+{
+    void *m = mmap(NULL, GUEST_SPACE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    mprotect(m, 0x10000, PROT_NONE);
+    return m;
+}
+#endif
+
+static int game_main(int argc, char **argv)
 {
 #ifndef __vita__
     struct sigaction sa;
@@ -511,13 +672,12 @@ int main(int argc, char **argv)
     const char *image = (argc > 1) ? argv[1] : "image.bin";
     trace_imports = getenv("TMNT_TRACE_IMPORTS") && atoi(getenv("TMNT_TRACE_IMPORTS"));
     trace_init();
-    void *m = mmap(NULL, GUEST_SPACE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (m == MAP_FAILED) {
+    void *m = alloc_guest_space();
+    if (!m) {
         rt_log("[rt] cannot reserve %u MB of guest space\n", GUEST_SPACE >> 20);
         return 2;
     }
     guest_membase = m;
-    mprotect(guest_membase, 0x10000, PROT_NONE);
     heap_init(GUEST_HEAP_LO, GUEST_SPACE);
     load_image(image);
 
@@ -531,6 +691,20 @@ int main(int argc, char **argv)
     c->stack_low_water = GUEST_STACK_TOP;
     init_teb(c);
     rt_win32_init(c);
+    prof_cpu = c;
+#ifdef __vita__
+    rdtsc_cache_lo = sceKernelGetProcessTimeLow();
+    {
+        pthread_t tk;
+        pthread_create(&tk, NULL, rdtsc_ticker, NULL);
+        pthread_detach(tk);
+    }
+#endif
+    if (prof_on) {
+        pthread_t ps;
+        pthread_create(&ps, NULL, prof_sampler, NULL);
+        pthread_detach(ps);
+    }
     if (getenv("TMNT_SELFTEST")) { selftest(c); return 0; }
 
     gpush_generated(c, 0xFFFFFFF0U);
@@ -540,3 +714,46 @@ int main(int argc, char **argv)
     rt_log("[rt] entry point returned eax=%08x\n", c->eax);
     return (int)c->eax;
 }
+
+#ifdef __vita__
+static int game_exit;
+
+static void *game_thread(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(1, 0);
+    char *argv[] = { "tmnt", NULL };
+    game_exit = game_main(1, argv);
+    return NULL;
+}
+
+int main(void)
+{
+    sceIoMkdir("ux0:data", 0777);
+    sceIoMkdir(VITA_DATA_DIR, 0777);
+    chdir(VITA_DATA_DIR);
+    freopen("log.txt", "w", stderr);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    scePowerSetArmClockFrequency(444);
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
+    char cwd[256];
+    rt_log("[vita] cwd %s, clocks arm %d gpu %d MHz\n", getcwd(cwd, sizeof cwd) ? cwd : "?", scePowerGetArmClockFrequency(),
+           scePowerGetGpuClockFrequency());
+    load_env_file();
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, VITA_GAME_STACK);
+    pthread_t t;
+    pthread_create(&t, &a, game_thread, NULL);
+    pthread_join(t, NULL);
+    rt_log("[vita] game exited (%d)\n", game_exit);
+    return game_exit;
+}
+#else
+int main(int argc, char **argv)
+{
+    return game_main(argc, argv);
+}
+#endif

@@ -11,6 +11,7 @@
 
 #include "game_hooks.h"
 #include "guest.h"
+#include "osdep.h"
 #include "runtime.h"
 
 #define AREA_TABLE 0x005e0560U
@@ -101,4 +102,55 @@ void tmnt_hook_start_area(CPU *c)
         idx = resume;
     }
     last_index = (int)idx;
+}
+
+/* The title screen's update runs every frame while it is shown; the Vita's Start button is Enter there and Esc (pause) elsewhere. */
+static volatile uint64_t title_seen_us;
+
+void tmnt_hook_title(CPU *c)
+{
+    (void)c;
+    title_seen_us = rt_now_us();
+}
+
+int tmnt_title_active(void)
+{
+    uint64_t t = title_seen_us;
+    return t && rt_now_us() - t < 200000U;
+}
+
+/* CRT _getptd (0x56abe9): GetLastError, TlsGetValue(index at 0x600850) through the pointer at 0x830024, allocation on a miss,
+ * SetLastError. When that pointer is still the TlsGetValue import (no FLS) and the slot is set, the result is the slot itself:
+ * read it from the TEB the way k_TlsGetValue does and return; otherwise the translated body runs. */
+#define GETPTD_TLS_INDEX 0x00600850U
+#define GETPTD_GET_FN 0x00830024U
+#define IAT_TLSGETVALUE 0x0058b1b4U
+
+int tmnt_fast_getptd(CPU *c)
+{
+    if (ld32(GETPTD_GET_FN) != ld32(IAT_TLSGETVALUE)) return 0;
+    uint32_t idx = ld32(GETPTD_TLS_INDEX);
+    if (idx >= 64U) return 0;
+    uint32_t ptd = ld32(rt_current_teb(c) + 0xE10U + 4U * idx);
+    if (!ptd) return 0;
+    c->eax = ptd;
+    c->esp += 4U;   /* the function's `ret` */
+    return 1;
+}
+
+/* 0x4b3354: `call [0x69f838]; sub eax, [0x69f848]; sbb edx, [0x69f84c]; ret`. The pointer holds 0x4b33a9, a stack-framed rdtsc
+ * read; the game calls this ~14500 times a frame in fights. Same result straight from the host clock. */
+#define TICKS_CLOCK_FN 0x0069f838U
+#define TICKS_BASE 0x0069f848U
+#define RDTSC_READER 0x004b33a9U
+
+int tmnt_fast_ticks(CPU *c)
+{
+    if (ld32(TICKS_CLOCK_FN) != RDTSC_READER) return 0;
+    uint64_t base = (uint64_t)ld32(TICKS_BASE) | ((uint64_t)ld32(TICKS_BASE + 4U) << 32);
+    uint64_t t = guest_rdtsc() - base;
+    c->eax = (uint32_t)t;
+    c->edx = (uint32_t)(t >> 32);
+    c->esp += 4U;   /* the function's `ret` */
+    return 1;
 }

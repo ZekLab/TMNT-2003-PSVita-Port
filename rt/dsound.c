@@ -8,6 +8,7 @@
 
 #include "com.h"
 #include "dx_consts.h"
+#include "osdep.h"
 #include "plat.h"
 
 #define DS_OK 0U
@@ -274,6 +275,7 @@ void dsound_mix(int16_t *out, int frames)
 static void *silent_mixer(void *arg)
 {
     (void)arg;
+    rt_thread_place_self(0, 2);
     static int16_t scratch[2 * 4410];
     uint64_t last = plat_ticks_us();
     for (;;) {

@@ -8,13 +8,147 @@
 
 #include "d3d9.h"
 
+/* GL state cache. The draw path re-specifies the whole fixed-function state for every D3D draw; vitaGL marks its pipeline dirty
+ * (and re-selects a shader) on each such call even when nothing changed. Every simple state call in this file goes through these
+ * wrappers, which forward a call only when the value differs from the last one sent. Texture binds and lights are not cached
+ * (deleted names and light positions depend on more than the arguments). All GL calls come from the render thread. */
+static GLenum sc_unit;   /* active texture unit, 0..3 */
+static GLenum sc_client_unit = 0xFFFFFFFFU;
+typedef struct { GLenum cap; GLenum unit; int on; } sc_cap;
+static sc_cap sc_caps[48];
+static int sc_ncaps;
+static void sc_enable(GLenum cap, int on)
+{
+    int per_unit = cap == GL_TEXTURE_2D;
+#ifdef GL_TEXTURE_GEN_S
+    per_unit |= cap == GL_TEXTURE_GEN_S || cap == GL_TEXTURE_GEN_T || cap == GL_TEXTURE_GEN_R;
+#endif
+    GLenum unit = per_unit ? sc_unit : 0;
+    for (int i = 0; i < sc_ncaps; i++)
+        if (sc_caps[i].cap == cap && sc_caps[i].unit == unit) {
+            if (sc_caps[i].on == on) return;
+            sc_caps[i].on = on;
+            if (on) glEnable(cap); else glDisable(cap);
+            return;
+        }
+    if (sc_ncaps < 48) { sc_caps[sc_ncaps].cap = cap; sc_caps[sc_ncaps].unit = unit; sc_caps[sc_ncaps].on = on; sc_ncaps++; }
+    if (on) glEnable(cap); else glDisable(cap);
+}
+static void sc_active_texture(GLenum t)
+{
+    GLenum u = t - GL_TEXTURE0;
+    if (u == sc_unit) return;
+    sc_unit = u;
+    glActiveTexture(t);
+}
+static void sc_client_active_texture(GLenum t)
+{
+    if (t == sc_client_unit) return;
+    sc_client_unit = t;
+    glClientActiveTexture(t);
+}
+/* Texture environment, per unit: integer parameters by name, the scales and the constant colour. */
+typedef struct { GLenum pname; GLint v; } sc_env;
+static sc_env sc_envs[4][24];
+static int sc_nenv[4];
+static float sc_env_scale[4][2] = { { -1, -1 }, { -1, -1 }, { -1, -1 }, { -1, -1 } };
+static float sc_env_color[4][4] = { { -1, -1, -1, -1 }, { -1, -1, -1, -1 }, { -1, -1, -1, -1 }, { -1, -1, -1, -1 } };
+static void sc_tex_envi(GLenum target, GLenum pname, GLint v)
+{
+    int u = (int)sc_unit & 3;
+    for (int i = 0; i < sc_nenv[u]; i++)
+        if (sc_envs[u][i].pname == pname) {
+            if (sc_envs[u][i].v == v) return;
+            sc_envs[u][i].v = v;
+            glTexEnvi(target, pname, v);
+            return;
+        }
+    if (sc_nenv[u] < 24) { sc_envs[u][sc_nenv[u]].pname = pname; sc_envs[u][sc_nenv[u]].v = v; sc_nenv[u]++; }
+    glTexEnvi(target, pname, v);
+}
+static void sc_tex_envf(GLenum target, GLenum pname, GLfloat v)
+{
+    int u = (int)sc_unit & 3, k = pname == GL_RGB_SCALE ? 0 : pname == GL_ALPHA_SCALE ? 1 : -1;
+    if (k >= 0 && sc_env_scale[u][k] == v) return;
+    if (k >= 0) sc_env_scale[u][k] = v;
+    glTexEnvf(target, pname, v);
+}
+static void sc_tex_envfv(GLenum target, GLenum pname, GLfloat *v)
+{
+    int u = (int)sc_unit & 3;
+    if (pname == GL_TEXTURE_ENV_COLOR) {
+        if (memcmp(sc_env_color[u], v, sizeof sc_env_color[u]) == 0) return;
+        memcpy(sc_env_color[u], v, sizeof sc_env_color[u]);
+    }
+    glTexEnvfv(target, pname, v);
+}
+/* Single-valued states: the last arguments, compared as a key of up to four words. */
+enum { SC_DEPTHMASK, SC_DEPTHFUNC, SC_ALPHAFUNC, SC_BLENDFUNC, SC_BLENDEQ, SC_CULLFACE, SC_FRONTFACE, SC_COLORMASK, SC_SHADE,
+       SC_POLYMODE, SC_FOGMODE, SC_FOGSTART, SC_FOGEND, SC_FOGDENSITY, SC_FOGCOLOR, SC_COUNT };
+static uint32_t sc_key[SC_COUNT][4];
+static uint8_t sc_valid[SC_COUNT];
+static int sc_same(int k, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    if (sc_valid[k] && sc_key[k][0] == a && sc_key[k][1] == b && sc_key[k][2] == c && sc_key[k][3] == d) return 1;
+    sc_valid[k] = 1; sc_key[k][0] = a; sc_key[k][1] = b; sc_key[k][2] = c; sc_key[k][3] = d;
+    return 0;
+}
+static uint32_t sc_f(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static void sc_depth_mask(GLboolean m) { if (!sc_same(SC_DEPTHMASK, m, 0, 0, 0)) glDepthMask(m); }
+static void sc_depth_func(GLenum f) { if (!sc_same(SC_DEPTHFUNC, f, 0, 0, 0)) glDepthFunc(f); }
+static void sc_alpha_func(GLenum f, GLfloat r) { if (!sc_same(SC_ALPHAFUNC, f, sc_f(r), 0, 0)) glAlphaFunc(f, r); }
+static void sc_blend_func(GLenum a, GLenum b) { if (!sc_same(SC_BLENDFUNC, a, b, 0, 0)) glBlendFunc(a, b); }
+static void sc_blend_equation(GLenum e) { if (!sc_same(SC_BLENDEQ, e, 0, 0, 0)) glBlendEquation(e); }
+static void sc_cull_face(GLenum m) { if (!sc_same(SC_CULLFACE, m, 0, 0, 0)) glCullFace(m); }
+static void sc_front_face(GLenum m) { if (!sc_same(SC_FRONTFACE, m, 0, 0, 0)) glFrontFace(m); }
+static void sc_color_mask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { if (!sc_same(SC_COLORMASK, r, g, b, a)) glColorMask(r, g, b, a); }
+static void sc_shade_model(GLenum m) { if (!sc_same(SC_SHADE, m, 0, 0, 0)) glShadeModel(m); }
+static void sc_polygon_mode(GLenum f, GLenum m) { if (!sc_same(SC_POLYMODE, f, m, 0, 0)) glPolygonMode(f, m); }
+static void sc_fogi(GLenum p, GLint v) { if (p != GL_FOG_MODE || !sc_same(SC_FOGMODE, (uint32_t)v, 0, 0, 0)) glFogi(p, v); }
+static void sc_fogf(GLenum p, GLfloat v)
+{
+    int k = p == GL_FOG_START ? SC_FOGSTART : p == GL_FOG_END ? SC_FOGEND : p == GL_FOG_DENSITY ? SC_FOGDENSITY : -1;
+    if (k < 0 || !sc_same(k, sc_f(v), 0, 0, 0)) glFogf(p, v);
+}
+static void sc_fogfv(GLenum p, const GLfloat *v)
+{
+    if (p != GL_FOG_COLOR || !sc_same(SC_FOGCOLOR, sc_f(v[0]), sc_f(v[1]), sc_f(v[2]), sc_f(v[3]))) glFogfv(p, v);
+}
+#define glEnable(cap) sc_enable((cap), 1)
+#define glDisable(cap) sc_enable((cap), 0)
+#define glActiveTexture sc_active_texture
+#define glClientActiveTexture sc_client_active_texture
+#define glTexEnvi sc_tex_envi
+#define glTexEnvf sc_tex_envf
+#define glTexEnvfv sc_tex_envfv
+#define glDepthMask sc_depth_mask
+#define glDepthFunc sc_depth_func
+#define glAlphaFunc sc_alpha_func
+#define glBlendFunc sc_blend_func
+#define glBlendEquation sc_blend_equation
+#define glCullFace sc_cull_face
+#define glFrontFace sc_front_face
+#define glColorMask sc_color_mask
+#define glShadeModel sc_shade_model
+#define glPolygonMode sc_polygon_mode
+#define glFogi sc_fogi
+#define glFogf sc_fogf
+#define glFogfv sc_fogfv
+
 static GLuint white_tex;
 static uint8_t *colors, *speculars;
 static float *positions;
 static size_t scratch_vertices;
 static int shot_frame = -1, shot_every;
+/* Texture coordinate generation on the CPU: always on the Vita (vitaGL has no glTexGen), TMNT_CPU_TEXGEN=1 elsewhere for comparison. */
+static int cpu_texgen = -1;
 static int dump_frame = -2;
 static uint64_t last_present_us;
+/* Frame time split, logged with the fps line: draw calls, texture uploads (part of the draws), the buffer swap; the rest is the game. */
+static uint64_t prof_draw_us, prof_upload_us, prof_swap_us, prof_upload_bytes, prof_frame_start;
+static uint32_t prof_draws, prof_uploads;
+static int map_fbw, map_fbh;
+static void update_mapping(d3d_device *d);
 
 static void ensure_scratch(size_t n)
 {
@@ -34,11 +168,51 @@ void gl_init_device(d3d_device *d)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glViewport(0, 0, (GLsizei)d->width, (GLsizei)d->height);
+    update_mapping(d);
+    glViewport(0, 0, map_fbw, map_fbh);
     const char *s = getenv("TMNT_SHOT_FRAME");
     if (s) shot_frame = atoi(s);
     s = getenv("TMNT_SHOT_EVERY");
     if (s) shot_every = atoi(s);
+}
+
+
+/* The game draws in its own resolution (800x600); every viewport, scissor and clear rectangle is mapped onto the real
+ * framebuffer, either stretched to fill it (default, as in the Rogue Squadron port) or kept at 4:3 with black bars
+ * (TMNT_ASPECT=4:3). Rectangles are D3D-style (top-left origin) and come out in GL window coordinates. */
+static float map_sx = 1.0f, map_sy = 1.0f;
+static int map_ox, map_oy;
+
+static void update_mapping(d3d_device *d)
+{
+    int fw = (int)d->width, fh = (int)d->height;
+    plat_screen_size(&fw, &fh);
+    map_fbw = fw;
+    map_fbh = fh;
+    const char *a = getenv("TMNT_ASPECT");
+    if (a && strcmp(a, "4:3") == 0 && fw * 3 != fh * 4) {
+        int w = fw, h = fh;
+        if (fw * 3 > fh * 4) w = fh * 4 / 3; else h = fw * 3 / 4;
+        map_ox = (fw - w) / 2;
+        map_oy = (fh - h) / 2;
+        map_sx = (float)w / (float)d->width;
+        map_sy = (float)h / (float)d->height;
+    } else {
+        map_ox = map_oy = 0;
+        map_sx = (float)fw / (float)d->width;
+        map_sy = (float)fh / (float)d->height;
+    }
+}
+
+static void map_rect(d3d_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h, GLint out[4])
+{
+    (void)d;
+    int x0 = map_ox + (int)((float)x * map_sx + 0.5f), x1 = map_ox + (int)((float)(x + w) * map_sx + 0.5f);
+    int y0 = map_oy + (int)((float)y * map_sy + 0.5f), y1 = map_oy + (int)((float)(y + h) * map_sy + 0.5f);
+    out[0] = x0;
+    out[1] = map_fbh - y1;
+    out[2] = x1 - x0;
+    out[3] = y1 - y0;
 }
 
 /* ------------------------------------------------------------ textures --- */
@@ -77,12 +251,25 @@ static void expand_level(uint32_t fmt, const uint8_t *src, uint32_t pitch, uint3
     }
 }
 
+static void upload_texture(d3d_tex *t);
 void gl_upload_texture(d3d_tex *t)
+{
+    if (!t->dirty && t->gl) { glBindTexture(GL_TEXTURE_2D, t->gl); return; }
+    uint64_t t0 = plat_ticks_us();
+    upload_texture(t);
+    prof_upload_us += plat_ticks_us() - t0;
+    prof_uploads++;
+    prof_upload_bytes += (uint64_t)t->w * t->h * 4;
+}
+
+static void upload_texture(d3d_tex *t)
 {
     if (!t->gl) {
         glGenTextures(1, &t->gl);
         glBindTexture(GL_TEXTURE_2D, t->gl);
+#ifndef __vita__
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)t->levels - 1);
+#endif
     } else {
         glBindTexture(GL_TEXTURE_2D, t->gl);
     }
@@ -142,13 +329,16 @@ static void color4(uint32_t argb, float out[4])
     out[2] = (float)(argb & 255) / 255.0f; out[3] = (float)(argb >> 24) / 255.0f;
 }
 
+/* Set per draw by apply_stages: the texture factor is fed as the primary colour (see there). */
+static int tf_as_primary;
+
 static GLint arg_source(uint32_t a, int stage)
 {
     switch (a & 0xF) {
     case D3DTA_DIFFUSE: return GL_PRIMARY_COLOR;
     case D3DTA_CURRENT: return stage == 0 ? GL_PRIMARY_COLOR : GL_PREVIOUS;
     case D3DTA_TEXTURE: return GL_TEXTURE;
-    case D3DTA_TFACTOR: return GL_CONSTANT;
+    case D3DTA_TFACTOR: return tf_as_primary ? GL_PRIMARY_COLOR : GL_CONSTANT;
     default: return GL_PRIMARY_COLOR;
     }
 }
@@ -159,6 +349,25 @@ static GLint arg_operand(uint32_t a, int alpha)
     if (alpha || rep) return comp ? GL_ONE_MINUS_SRC_ALPHA : GL_SRC_ALPHA;
     return comp ? GL_ONE_MINUS_SRC_COLOR : GL_SRC_COLOR;
 }
+
+#ifndef GL_SOURCE0_RGB   /* vitaGL uses the GL 1.5 names (same values) */
+#define GL_SOURCE0_RGB GL_SRC0_RGB
+#define GL_SOURCE1_RGB GL_SRC1_RGB
+#define GL_SOURCE2_RGB GL_SRC2_RGB
+#define GL_SOURCE0_ALPHA GL_SRC0_ALPHA
+#define GL_SOURCE1_ALPHA GL_SRC1_ALPHA
+#define GL_SOURCE2_ALPHA GL_SRC2_ALPHA
+#endif
+
+#ifdef __vita__
+/* vitaGL lights: glLightfv only and no spot lights (spot parameters are dropped). */
+#define GL_SPOT_EXPONENT 0x1205
+#define GL_SPOT_CUTOFF 0x1206
+#define GL_SPOT_DIRECTION 0x1204
+static void vita_light_f(GLenum l, GLenum p, GLfloat v) { if (p != GL_SPOT_CUTOFF && p != GL_SPOT_EXPONENT) glLightfv(l, p, &v); }
+#define glLightf vita_light_f
+#define glLightfv(l, p, v) ((p) == GL_SPOT_DIRECTION ? (void)0 : glLightfv((l), (p), (v)))
+#endif
 
 static void combine(int alpha, uint32_t op, uint32_t a1, uint32_t a2, int stage)
 {
@@ -207,10 +416,40 @@ static int uses_texture(uint32_t op, uint32_t a1, uint32_t a2)
 }
 
 /* Returns the number of texture units set up. */
-static int apply_stages(d3d_device *d, int texcoords)
+/* Whether the enabled stages read the diffuse colour (directly, as CURRENT on stage 0, through an op that blends with it,
+ * or through a source the combiner maps to the primary colour). Mirrors the argument choice in apply_stages. */
+static int stages_read_diffuse(d3d_device *d)
+{
+    for (int s = 0; s < MAX_STAGES && s < 4; s++) {
+        uint32_t *t = d->tss[s];
+        if (t[D3DTSS_COLOROP] == D3DTOP_DISABLE) return s == 0;   /* no stages: the output is the diffuse colour itself */
+        for (int alpha = 0; alpha < 2; alpha++) {
+            uint32_t op = t[alpha ? D3DTSS_ALPHAOP : D3DTSS_COLOROP];
+            uint32_t a1 = t[alpha ? D3DTSS_ALPHAARG1 : D3DTSS_COLORARG1], a2 = t[alpha ? D3DTSS_ALPHAARG2 : D3DTSS_COLORARG2];
+            if (op == D3DTOP_DISABLE) { if (alpha && s == 0) return 1; continue; }
+            if (!d->tex[s] && op == D3DTOP_SELECTARG1 && (a1 & 0xF) == D3DTA_TEXTURE) op = D3DTOP_SELECTARG2;
+            if (op == D3DTOP_BLENDDIFFUSEALPHA || (op == D3DTOP_BLENDCURRENTALPHA && s == 0)) return 1;
+            for (int k = 0; k < 2; k++) {
+                uint32_t a = k ? a2 : a1;
+                if ((k == 0 && op == D3DTOP_SELECTARG2) || (k == 1 && op == D3DTOP_SELECTARG1)) continue;
+                uint32_t src = a & 0xF;
+                if (src == D3DTA_DIFFUSE || (src == D3DTA_CURRENT && s == 0)) return 1;
+                if (src != D3DTA_CURRENT && src != D3DTA_TEXTURE && src != D3DTA_TFACTOR) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Returns the number of texture units set up. no_vertex_colour: the draw has no colour array and no lighting, so the primary
+ * colour is a constant. vitaGL's combiner ignores GL_CONSTANT (TFACTOR): the turtles' black outline hulls (SELECTARG2 TFACTOR)
+ * came out white. When the stages never read the diffuse colour, the factor goes in as the primary colour instead. */
+static int apply_stages(d3d_device *d, int texcoords, int no_vertex_colour)
 {
     float tf[4];
     color4(d->rs[D3DRS_TEXTUREFACTOR], tf);
+    tf_as_primary = no_vertex_colour && !stages_read_diffuse(d);
+    if (tf_as_primary) glColor4f(tf[0], tf[1], tf[2], tf[3]);
     int unit = 0;
     for (int s = 0; s < MAX_STAGES && s < 4; s++) {
         uint32_t *t = d->tss[s];
@@ -238,10 +477,19 @@ static int apply_stages(d3d_device *d, int texcoords)
         combine(0, cop, c1, c2, s);
         combine(1, aop, a1, a2, s);
         uint32_t tci = t[D3DTSS_TEXCOORDINDEX], gen = tci & 0xFFFF0000U;
+        if (cpu_texgen < 0) {
+#ifdef __vita__
+            cpu_texgen = 1;
+#else
+            cpu_texgen = getenv("TMNT_CPU_TEXGEN") && atoi(getenv("TMNT_CPU_TEXGEN"));
+#endif
+        }
         glMatrixMode(GL_TEXTURE);
-        if (t[D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) glLoadMatrixf(d->texm[s]); else glLoadIdentity();
+        /* CPU-generated coordinates already include the texture transform. */
+        if ((t[D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) && !(gen && cpu_texgen)) glLoadMatrixf(d->texm[s]); else glLoadIdentity();
         glMatrixMode(GL_MODELVIEW);
-        if (gen) {
+#ifndef __vita__
+        if (gen && !cpu_texgen) {
             GLint mode = gen == D3DTSS_TCI_CAMERASPACENORMAL ? GL_NORMAL_MAP : gen == D3DTSS_TCI_SPHEREMAP ? GL_SPHERE_MAP
                        : gen == D3DTSS_TCI_CAMERASPACEPOSITION ? GL_EYE_LINEAR : GL_REFLECTION_MAP;
             glTexGeni(GL_S, GL_TEXTURE_GEN_MODE, mode);
@@ -252,13 +500,16 @@ static int apply_stages(d3d_device *d, int texcoords)
         } else {
             glDisable(GL_TEXTURE_GEN_S); glDisable(GL_TEXTURE_GEN_T); glDisable(GL_TEXTURE_GEN_R);
         }
+#endif
         (void)texcoords;
         unit = s + 1;
     }
     for (int s = unit; s < 4; s++) {
         glActiveTexture(GL_TEXTURE0 + (GLenum)s);
         glDisable(GL_TEXTURE_2D);
+#ifndef __vita__
         glDisable(GL_TEXTURE_GEN_S); glDisable(GL_TEXTURE_GEN_T); glDisable(GL_TEXTURE_GEN_R);
+#endif
     }
     glActiveTexture(GL_TEXTURE0);
     return unit;
@@ -286,8 +537,17 @@ static GLenum gl_blend(uint32_t b)
     case D3DBLEND_DESTCOLOR: return GL_DST_COLOR;
     case D3DBLEND_INVDESTCOLOR: return GL_ONE_MINUS_DST_COLOR;
     case D3DBLEND_SRCALPHASAT: return GL_SRC_ALPHA_SATURATE;
+#ifdef __vita__
+    /* vitaGL has no constant blend colour; logged once if the game ever asks for it. */
+    case D3DBLEND_BLENDFACTOR: case D3DBLEND_INVBLENDFACTOR: {
+        static int logged;
+        if (!logged) { logged = 1; rt_log("[gl] blend factor %u unsupported on the Vita\n", b); }
+        return b == D3DBLEND_BLENDFACTOR ? GL_ONE : GL_ZERO;
+    }
+#else
     case D3DBLEND_BLENDFACTOR: return GL_CONSTANT_COLOR;
     case D3DBLEND_INVBLENDFACTOR: return GL_ONE_MINUS_CONSTANT_COLOR;
+#endif
     default: return GL_ONE;
     }
 }
@@ -355,7 +615,9 @@ static void apply_render_states(d3d_device *d, int pretransformed)
     }
     if (rs[D3DRS_SCISSORTESTENABLE]) {
         glEnable(GL_SCISSOR_TEST);
-        glScissor((GLint)d->scissor[0], (GLint)(d->height - d->scissor[3]), (GLsizei)(d->scissor[2] - d->scissor[0]), (GLsizei)(d->scissor[3] - d->scissor[1]));
+        GLint r[4];
+        map_rect(d, d->scissor[0], d->scissor[1], d->scissor[2] - d->scissor[0], d->scissor[3] - d->scissor[1], r);
+        glScissor(r[0], r[1], r[2], r[3]);
     } else {
         glDisable(GL_SCISSOR_TEST);
     }
@@ -390,7 +652,9 @@ static void apply_lighting(d3d_device *d, int has_normal, int has_diffuse, int h
     float amb[4];
     color4(rs[D3DRS_AMBIENT], amb);
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+#ifndef __vita__
     glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, rs[D3DRS_LOCALVIEWER] ? GL_TRUE : GL_FALSE);
+#endif
     const float *m = d->material;
     glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, m);
     glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, m + 4);
@@ -550,11 +814,74 @@ static void load_projection(d3d_device *d)
 static void set_viewport(d3d_device *d)
 {
     uint32_t *vp = d->viewport;
-    glViewport((GLint)vp[0], (GLint)(d->height - vp[1] - vp[3]), (GLsizei)vp[2], (GLsizei)vp[3]);
+    GLint r[4];
+    map_rect(d, vp[0], vp[1], vp[2], vp[3], r);
+    glViewport(r[0], r[1], r[2], r[3]);
     glDepthRange(u2f(vp[4]), u2f(vp[5]));
 }
 
+/* D3D texture coordinate generation done on the CPU for stage s: the camera-space normal (world * view, normalised when
+ * D3DRS_NORMALIZENORMALS is set) as (x, y, z, 1), through the stage's texture transform when one is set; the turtles' cel shading
+ * uses it. Other modes, or a draw without normals, get (0, 0) so the unit still has coordinates (vitaGL crashed without them). */
+static float *texgen_buf[4];
+static size_t texgen_cap[4];
+static const float *cpu_texgen_coords(d3d_device *d, int s, uint32_t gen, const vfmt *v, const uint8_t *const sbase[4],
+                                      const uint32_t sstride[4], uint32_t total)
+{
+    if (texgen_cap[s] < total) {
+        texgen_cap[s] = total + 1024;
+        texgen_buf[s] = realloc(texgen_buf[s], texgen_cap[s] * 8);
+    }
+    float *out = texgen_buf[s];
+    if (gen != D3DTSS_TCI_CAMERASPACENORMAL || v->normal_off < 0 || v->pos_rhw) {
+        static int logged;
+        if (!logged++) rt_log("[gl] texgen %08x without CPU support (normals %d): constant coordinates\n", gen, v->normal_off >= 0);
+        memset(out, 0, (size_t)total * 8);
+        return out;
+    }
+    float a[9], wv[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            a[i * 3 + j] = d->world[i * 4] * d->view[j] + d->world[i * 4 + 1] * d->view[4 + j] + d->world[i * 4 + 2] * d->view[8 + j];
+    /* Normals go through the inverse transpose of world * view (as in D3D and GL): cofactors over the determinant. With a scaled
+     * model the plain matrix scales the normal, the ramp coordinate runs off the end and wraps (white outlines). */
+    wv[0] = a[4] * a[8] - a[5] * a[7]; wv[1] = a[5] * a[6] - a[3] * a[8]; wv[2] = a[3] * a[7] - a[4] * a[6];
+    wv[3] = a[2] * a[7] - a[1] * a[8]; wv[4] = a[0] * a[8] - a[2] * a[6]; wv[5] = a[1] * a[6] - a[0] * a[7];
+    wv[6] = a[1] * a[5] - a[2] * a[4]; wv[7] = a[2] * a[3] - a[0] * a[5]; wv[8] = a[0] * a[4] - a[1] * a[3];
+    float det = a[0] * wv[0] + a[1] * wv[1] + a[2] * wv[2];
+    if (det != 0.0f) for (int i = 0; i < 9; i++) wv[i] /= det;
+    const float *m = d->texm[s];
+    int xf = (d->tss[s][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) != 0, norm = d->rs[D3DRS_NORMALIZENORMALS] != 0;
+    const uint8_t *p = sbase[v->normal_stream] + v->normal_off;
+    uint32_t st = sstride[v->normal_stream];
+    for (uint32_t i = 0; i < total; i++, p += st) {
+        float n[3];
+        memcpy(n, p, 12);
+        float c0 = n[0] * wv[0] + n[1] * wv[3] + n[2] * wv[6];
+        float c1 = n[0] * wv[1] + n[1] * wv[4] + n[2] * wv[7];
+        float c2 = n[0] * wv[2] + n[1] * wv[5] + n[2] * wv[8];
+        if (norm) {
+            float l = c0 * c0 + c1 * c1 + c2 * c2;
+            if (l > 0.0f) { l = 1.0f / sqrtf(l); c0 *= l; c1 *= l; c2 *= l; }
+        }
+        out[i * 2] = xf ? c0 * m[0] + c1 * m[4] + c2 * m[8] + m[12] : c0;
+        out[i * 2 + 1] = xf ? c0 * m[1] + c1 * m[5] + c2 * m[9] + m[13] : c1;
+    }
+    return out;
+}
+
+static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
+                 const void *indices, int index32, uint32_t index_count);
 void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
+             const void *indices, int index32, uint32_t index_count)
+{
+    uint64_t t0 = plat_ticks_us();
+    draw(d, prim, vbase, stride0, first_vertex, num_vertices, indices, index32, index_count);
+    prof_draw_us += plat_ticks_us() - t0;
+    prof_draws++;
+}
+
+static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
              const void *indices, int index32, uint32_t index_count)
 {
     vfmt v;
@@ -567,6 +894,33 @@ void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uin
                t0 ? t0->h : 0, t0 ? t0->fmt : 0, d->tss[0][D3DTSS_COLOROP], d->tss[0][D3DTSS_ALPHAOP], d->viewport[0], d->viewport[1],
                d->viewport[2], d->viewport[3], d->rs[D3DRS_LIGHTING], d->rs[D3DRS_ZENABLE], d->rs[D3DRS_ALPHABLENDENABLE],
                d->rs[D3DRS_ALPHATESTENABLE], d->rs[D3DRS_CULLMODE]);
+        const float *mt = d->material;
+        rt_log("[draw]   stages: 0 %u(%x,%x)/%u(%x,%x) tci %x  1 %u(%x,%x)/%u  tex1 %s; tfactor %08x colorvertex %u diffuse src %u ambient src %u "
+               "emissive src %u fog %u; material diffuse %.2f %.2f %.2f %.2f ambient %.2f %.2f %.2f emissive %.2f %.2f %.2f; normals %d colors %d\n",
+               d->tss[0][D3DTSS_COLOROP], d->tss[0][D3DTSS_COLORARG1], d->tss[0][D3DTSS_COLORARG2], d->tss[0][D3DTSS_ALPHAOP],
+               d->tss[0][D3DTSS_ALPHAARG1], d->tss[0][D3DTSS_ALPHAARG2], d->tss[0][D3DTSS_TEXCOORDINDEX], d->tss[1][D3DTSS_COLOROP],
+               d->tss[1][D3DTSS_COLORARG1], d->tss[1][D3DTSS_COLORARG2], d->tss[1][D3DTSS_ALPHAOP], d->tex[1] ? "yes" : "no",
+               d->rs[D3DRS_TEXTUREFACTOR], d->rs[D3DRS_COLORVERTEX], d->rs[D3DRS_DIFFUSEMATERIALSOURCE], d->rs[D3DRS_AMBIENTMATERIALSOURCE],
+               d->rs[D3DRS_EMISSIVEMATERIALSOURCE], d->rs[D3DRS_FOGENABLE], mt[0], mt[1], mt[2], mt[3], mt[4], mt[5], mt[6], mt[12], mt[13], mt[14],
+               v.normal_off >= 0, v.diffuse_off >= 0);
+        for (int st = 0; st < 2; st++) {
+            const float *tm = d->texm[st];
+            rt_log("[draw]   stage %d: tci %x ttff %x addr %u/%u filter %u/%u/%u tex %s%ux%u fmt %x texm %.2f %.2f %.2f | %.2f %.2f %.2f | %.2f %.2f %.2f | %.2f %.2f %.2f\n",
+                   st, d->tss[st][D3DTSS_TEXCOORDINDEX], d->tss[st][D3DTSS_TEXTURETRANSFORMFLAGS], d->ss[st][D3DSAMP_ADDRESSU],
+                   d->ss[st][D3DSAMP_ADDRESSV], d->ss[st][D3DSAMP_MINFILTER], d->ss[st][D3DSAMP_MAGFILTER], d->ss[st][D3DSAMP_MIPFILTER],
+                   d->tex[st] ? "" : "none ", d->tex[st] ? d->tex[st]->w : 0, d->tex[st] ? d->tex[st]->h : 0, d->tex[st] ? d->tex[st]->fmt : 0,
+                   tm[0], tm[1], tm[2], tm[4], tm[5], tm[6], tm[8], tm[9], tm[10], tm[12], tm[13], tm[14]);
+        }
+        static int dumped1;
+        d3d_tex *t1 = d->tex[1];
+        if (t1 && !d3d_format_is_dxt(t1->fmt) && dumped1 < 4 && (d->tss[1][D3DTSS_TEXCOORDINDEX] & 0xFFFF0000U)) {
+            uint8_t *px = malloc((size_t)t1->w * t1->h * 4);
+            expand_level(t1->fmt, G2H(t1->mem[0]), t1->pitch[0], t1->w, t1->h, px);
+            char name[64];
+            snprintf(name, sizeof name, "tex1_%02d_%ux%u.png", dumped1++, t1->w, t1->h);
+            plat_write_rgba_png(name, px, (int)t1->w, (int)t1->h);
+            free(px);
+        }
         if (v.pos_rhw && !indices) {
             const uint8_t *vb = G2H(vbase);
             for (uint32_t k = first_vertex; k < first_vertex + num_vertices && k < first_vertex + 4; k++) {
@@ -588,8 +942,6 @@ void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uin
         }
     }
     if (stride0 == 0) return;
-    uint32_t total = first_vertex + num_vertices;
-    ensure_scratch(total);
     const uint8_t *base0 = (const uint8_t *)G2H(vbase);
     const uint8_t *sbase[4] = { base0, base0, base0, base0 };
     uint32_t sstride[4] = { stride0, stride0, stride0, stride0 };
@@ -597,6 +949,14 @@ void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uin
         for (int s = 1; s < 4; s++)
             if (d->stream[s].vb) { sbase[s] = (const uint8_t *)G2H(d->stream[s].vb->mem + d->stream[s].offset); sstride[s] = d->stream[s].stride; }
     }
+    /* A non-indexed draw from the middle of a buffer starts every stream at its first vertex, so only the drawn vertices are
+     * converted (colours, positions, generated coordinates) and handed to GL; dynamic buffers otherwise cost their whole prefix. */
+    if (!indices && first_vertex) {
+        for (int s = 0; s < 4; s++) sbase[s] += (size_t)first_vertex * sstride[s];
+        first_vertex = 0;
+    }
+    uint32_t total = first_vertex + num_vertices;
+    ensure_scratch(total);
     set_viewport(d);
     apply_render_states(d, v.pos_rhw);
     if (v.pos_rhw) {
@@ -636,16 +996,27 @@ void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uin
         glDisableClientState(GL_COLOR_ARRAY);
         glColor4f(1, 1, 1, 1);
     }
-    int units = apply_stages(d, v.tex_count);
+    int units = apply_stages(d, v.tex_count, v.diffuse_off < 0 && (v.pos_rhw || !d->rs[D3DRS_LIGHTING]));
+    /* Texture coordinate arrays: only units in use, plus those left enabled by an earlier draw. vitaGL has fewer client units than 4,
+     * and glClientActiveTexture on a missing one switched off unit 0's coordinates (every textured draw then read one texel: white screen). */
+    static int tc_enabled[4];
     for (int s = 0; s < 4; s++) {
-        glClientActiveTexture(GL_TEXTURE0 + (GLenum)s);
+        uint32_t gen = s < units ? d->tss[s][D3DTSS_TEXCOORDINDEX] & 0xFFFF0000U : 0;
+        const float *gen_uv = gen && cpu_texgen ? cpu_texgen_coords(d, s, gen, &v, sbase, sstride, total) : NULL;
         int set = s < units ? (int)(d->tss[s][D3DTSS_TEXCOORDINDEX] & 0xFFFF) : -1;
-        if (set >= 0 && set < v.tex_count && !(d->tss[s][D3DTSS_TEXCOORDINDEX] & 0xFFFF0000U)) {
+        int want = gen_uv || (set >= 0 && set < v.tex_count && !gen);
+        if (!want && !tc_enabled[s]) continue;
+        glClientActiveTexture(GL_TEXTURE0 + (GLenum)s);
+        if (gen_uv) {
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, 8, gen_uv);
+        } else if (want) {
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
             glTexCoordPointer(v.tex_size[set], GL_FLOAT, (GLsizei)sstride[v.tex_stream[set]], sbase[v.tex_stream[set]] + v.tex_off[set]);
         } else {
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         }
+        tc_enabled[s] = want;
     }
     glClientActiveTexture(GL_TEXTURE0);
     if (indices)
@@ -671,7 +1042,9 @@ void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t s
     if (flags & D3DCLEAR_STENCIL) { glClearStencil((GLint)stencil); glStencilMask(0xFF); m |= GL_STENCIL_BUFFER_BIT; }
     uint32_t *vp = d->viewport;
     glEnable(GL_SCISSOR_TEST);
-    glScissor((GLint)vp[0], (GLint)(d->height - vp[1] - vp[3]), (GLsizei)vp[2], (GLsizei)vp[3]);
+    GLint r[4];
+    map_rect(d, vp[0], vp[1], vp[2], vp[3], r);
+    glScissor(r[0], r[1], r[2], r[3]);
     glClear(m);
     glDisable(GL_SCISSOR_TEST);
 }
@@ -723,11 +1096,32 @@ void gl_present(d3d_device *d)
         snprintf(name, sizeof name, "frame_%04u.png", d->frame);
         plat_screenshot(name);
     }
+    uint64_t swap0 = plat_ticks_us();
     plat_swap();
+    prof_swap_us += plat_ticks_us() - swap0;
+    if (map_ox || map_oy) {
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     d->frame++;
     uint64_t now = plat_ticks_us();
     if (d->frame % 300 == 0) {
-        rt_log("[d3d] frame %u, %.1f fps, guest heap %u MB\n", d->frame, last_present_us ? 1e6 / (double)(now - last_present_us) : 0.0, rt_heap_used() >> 20);
+        extern uint64_t d3d_tex_bytes, d3d_buf_bytes;
+        extern uint32_t d3d_tex_count;
+        rt_log("[d3d] frame %u, %.1f fps, guest heap %u MB, live %u MB (textures %u: %llu MB, buffers %llu MB)\n", d->frame,
+               last_present_us ? 1e6 / (double)(now - last_present_us) : 0.0, rt_heap_used() >> 20, rt_heap_live() >> 20, d3d_tex_count,
+               (unsigned long long)(d3d_tex_bytes >> 20), (unsigned long long)(d3d_buf_bytes >> 20));
+        double frames = 300.0, total = prof_frame_start ? (double)(now - prof_frame_start) / frames / 1000.0 : 0.0;
+        double dr = (double)prof_draw_us / frames / 1000.0, sw = (double)prof_swap_us / frames / 1000.0;
+        rt_log("[prof] per frame: %.1f ms = draws %.1f ms (%u draws, uploads %.1f ms, %u textures %llu KB) + swap %.1f ms + game %.1f ms\n",
+               total, dr, prof_draws / 300U, (double)prof_upload_us / frames / 1000.0, prof_uploads / 300U,
+               (unsigned long long)(prof_upload_bytes / 300U / 1024U), sw, total - dr - sw);
+        rt_prof_report(300);
+        prof_draw_us = prof_upload_us = prof_swap_us = prof_upload_bytes = 0;
+        prof_draws = prof_uploads = 0;
+        prof_frame_start = now;
     }
     last_present_us = now;
     GLenum e = glGetError();

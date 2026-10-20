@@ -13,6 +13,7 @@
 #include "guest.h"
 #include "runtime.h"
 #include "plat.h"
+#include "osdep.h"
 
 #define ERROR_FILE_NOT_FOUND 2U
 #define ERROR_INVALID_HANDLE 6U
@@ -28,18 +29,42 @@ typedef struct rt_thread_ctx {
     uint32_t teb;
     uint32_t tid;
     int suspend;
-    pthread_mutex_t m;
-    pthread_cond_t cv;
+    rt_cond wake;
+    const char *last_import;      /* watchdog: the last API the thread called, and how many so far */
+    volatile uint32_t import_calls;
+    int cs_held;                  /* critical sections entered and not yet left */
+    volatile uint32_t fn_calls, fn_ring[8];   /* watchdog: translated functions entered, the last 8 */
+    volatile int stage;           /* watchdog: 1 = entering an API call, 2 = past the suspend check, 3 = returned */
+    volatile uint32_t waiting_cs; /* watchdog: critical section being entered */
+    int win_prio;                 /* SetThreadPriority value, applied when the host thread starts */
+    const rt_thunk *thunk;        /* the API being called (COM dispatch reads it) */
+    volatile int os_id;           /* host thread id once started (Vita), 0 before */
 } rt_thread_ctx;
+
 
 static rt_thread_ctx main_ctx;
 
-static __thread rt_thread_ctx *cur;
+/* Every guest thread context. */
+#define MAX_CTX 64
+static rt_thread_ctx *all_ctx[MAX_CTX];
+static int ctx_count;
+
+static CPU *main_cpu;
+
+/* The context of the thread whose CPU is c: every API call carries its CPU, so no thread-local storage is needed (on the Vita it is
+ * emulated by library calls, and threads hung inside them). A context's CPU is its first member. */
+static rt_thread_ctx *ctx_of_cpu(CPU *c)
+{
+    if (c == main_cpu) return &main_ctx;
+    for (int i = 0; i < ctx_count; i++)
+        if (&all_ctx[i]->cpu == c) return all_ctx[i];
+    return NULL;
+}
 static pthread_mutex_t big = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static uint32_t next_tid = 1001;
 
-uint32_t rt_current_teb(void) { return cur ? cur->teb : GUEST_TEB; }
-uint32_t rt_current_tid(void) { return cur ? cur->tid : 0; }
+uint32_t rt_current_teb(CPU *c) { rt_thread_ctx *x = ctx_of_cpu(c); return x ? x->teb : GUEST_TEB; }
+uint32_t rt_current_tid(CPU *c) { rt_thread_ctx *x = ctx_of_cpu(c); return x ? x->tid : 0; }
 
 /* ------------------------------------------------------------ handles --- */
 
@@ -48,8 +73,8 @@ enum { H_FREE, H_FILE, H_EVENT, H_MUTEX, H_THREAD, H_MAPPING };
 typedef struct rt_handle {
     int type;
     FILE *f;
-    pthread_mutex_t m;
-    pthread_cond_t cv;
+    rt_cond wake;
+    int wake_ready;
     int signaled, manual;
     uint32_t owner, count, pulses;
     pthread_t thread;
@@ -65,10 +90,14 @@ static uint32_t h_new(int type)
     pthread_mutex_lock(&big);
     for (uint32_t i = 1; i < MAX_HANDLES; i++) {
         if (handles[i].type == H_FREE) {
+            /* The kernel lock/condition of a slot is created once and kept across reuse. */
+            rt_cond wake = handles[i].wake;
+            int wake_ready = handles[i].wake_ready;
             memset(&handles[i], 0, sizeof handles[i]);
+            handles[i].wake = wake;
+            handles[i].wake_ready = wake_ready;
+            if (!handles[i].wake_ready) { rt_cond_init(&handles[i].wake); handles[i].wake_ready = 1; }
             handles[i].type = type;
-            pthread_mutex_init(&handles[i].m, NULL);
-            pthread_cond_init(&handles[i].cv, NULL);
             pthread_mutex_unlock(&big);
             return 0x1000U + i * 4U;
         }
@@ -180,7 +209,7 @@ static uint32_t k_GetVersionExA(CPU *c)
     return 1;
 }
 static uint32_t k_GetCurrentThread(CPU *c) { (void)c; return 0xFFFFFFFEU; }
-static uint32_t k_GetCurrentThreadId(CPU *c) { (void)c; return cur ? cur->tid : 1000; }
+static uint32_t k_GetCurrentThreadId(CPU *c) { rt_thread_ctx *x = ctx_of_cpu(c); return x ? x->tid : 1000; }
 static uint32_t k_GetCurrentProcessId(CPU *c) { (void)c; return 999; }
 static uint32_t k_GetCurrentProcess(CPU *c) { (void)c; return 0xFFFFFFFFU; }
 static uint32_t k_GetLastError(CPU *c) { return c->last_error; }
@@ -197,9 +226,7 @@ static uint32_t k_GetSystemInfo(CPU *c)
 static uint32_t k_IsProcessorFeaturePresent(CPU *c) { (void)c; return 0; }
 static uint32_t k_GetSystemTimeAsFileTime(CPU *c)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t ft = ((uint64_t)ts.tv_sec + 11644473600ULL) * 10000000ULL + (uint64_t)ts.tv_nsec / 100U;
+    uint64_t ft = ((uint64_t)time(NULL) + 11644473600ULL) * 10000000ULL;
     st32(ARG(0), (uint32_t)ft); st32(ARG(0) + 4, (uint32_t)(ft >> 32));
     return 0;
 }
@@ -214,16 +241,11 @@ static uint32_t k_GetLocalTime(CPU *c)
     st16(p + 12, (uint16_t)tm.tm_sec); st16(p + 14, 0);
     return 0;
 }
-static uint64_t now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000U;
-}
+static uint64_t now_us(void) { return rt_now_us(); }
 static uint32_t k_GetTickCount(CPU *c) { (void)c; return (uint32_t)(now_us() / 1000U); }
 static uint32_t k_QueryPerformanceCounter(CPU *c) { uint64_t v = now_us(); st32(ARG(0), (uint32_t)v); st32(ARG(0) + 4, (uint32_t)(v >> 32)); return 1; }
 static uint32_t k_QueryPerformanceFrequency(CPU *c) { st32(ARG(0), 1000000U); st32(ARG(0) + 4, 0); return 1; }
-static uint32_t k_Sleep(CPU *c) { uint32_t ms = ARG(0); if (ms) usleep(ms * 1000U); else sched_yield(); return 0; }
+static uint32_t k_Sleep(CPU *c) { uint32_t ms = ARG(0); if (ms) rt_sleep_us(ms * 1000U); else rt_yield(); return 0; }
 
 /* heap: every HeapCreate heap is the one guest heap */
 static uint32_t k_HeapCreate(CPU *c) { (void)c; return 0x00520000U; }
@@ -292,8 +314,29 @@ static pthread_mutex_t *cs_of(uint32_t p)
 static uint32_t k_InitializeCriticalSectionAndSpinCount(CPU *c) { memset(G2H(ARG(0)), 0, 24); st32(ARG(0) + 4, 0xFFFFFFFFU); (void)cs_of(ARG(0)); return 1; }
 static uint32_t k_InitializeCriticalSection(CPU *c) { memset(G2H(ARG(0)), 0, 24); st32(ARG(0) + 4, 0xFFFFFFFFU); (void)cs_of(ARG(0)); return 0; }
 static uint32_t k_DeleteCriticalSection(CPU *c) { (void)c; return 0; }
-static uint32_t k_EnterCriticalSection(CPU *c) { pthread_mutex_lock(cs_of(ARG(0))); return 0; }
-static uint32_t k_LeaveCriticalSection(CPU *c) { pthread_mutex_unlock(cs_of(ARG(0))); return 0; }
+static uint32_t cs_owner[MAX_CS], cs_depth[MAX_CS];   /* watchdog: owning tid and recursion depth */
+static uint32_t k_EnterCriticalSection(CPU *c)
+{
+    pthread_mutex_t *m = cs_of(ARG(0));
+    uint32_t id = (uint32_t)(m - cs_locks);
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    if (x) x->waiting_cs = ARG(0);
+    pthread_mutex_lock(m);
+    cs_owner[id] = x ? x->tid : 0;
+    cs_depth[id]++;
+    if (x) { x->waiting_cs = 0; x->cs_held++; }
+    return 0;
+}
+static uint32_t k_LeaveCriticalSection(CPU *c)
+{
+    pthread_mutex_t *m = cs_of(ARG(0));
+    uint32_t id = (uint32_t)(m - cs_locks);
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    if (x && x->cs_held > 0) x->cs_held--;
+    if (cs_depth[id] > 0 && --cs_depth[id] == 0) cs_owner[id] = 0;
+    pthread_mutex_unlock(m);
+    return 0;
+}
 static uint32_t k_InterlockedExchange(CPU *c)
 {
     pthread_mutex_lock(&big);
@@ -307,8 +350,8 @@ static uint32_t k_InterlockedExchange(CPU *c)
 static uint32_t tls_used;
 static uint32_t k_TlsAlloc(CPU *c) { (void)c; pthread_mutex_lock(&big); uint32_t i = tls_used < 64 ? tls_used++ : 0xFFFFFFFFU; pthread_mutex_unlock(&big); return i; }
 static uint32_t k_TlsFree(CPU *c) { (void)c; return 1; }
-static uint32_t k_TlsSetValue(CPU *c) { st32(rt_current_teb() + 0xE10U + 4U * ARG(0), ARG(1)); return 1; }
-static uint32_t k_TlsGetValue(CPU *c) { c->last_error = 0; return ld32(rt_current_teb() + 0xE10U + 4U * ARG(0)); }
+static uint32_t k_TlsSetValue(CPU *c) { st32(rt_current_teb(c) + 0xE10U + 4U * ARG(0), ARG(1)); return 1; }
+static uint32_t k_TlsGetValue(CPU *c) { c->last_error = 0; return ld32(rt_current_teb(c) + 0xE10U + 4U * ARG(0)); }
 
 /* locale: code page 1252, LCID 0x409 */
 static uint32_t k_GetACP(CPU *c) { (void)c; return 1252; }
@@ -524,10 +567,10 @@ static uint32_t k_CreateEventA(CPU *c)
 }
 static uint32_t k_SetEvent_impl(rt_handle *e, int pulse)
 {
-    pthread_mutex_lock(&e->m);
+    rt_cond_lock(&e->wake);
     if (pulse) e->pulses++; else e->signaled = 1;
-    pthread_cond_broadcast(&e->cv);
-    pthread_mutex_unlock(&e->m);
+    rt_cond_broadcast(&e->wake);
+    rt_cond_unlock(&e->wake);
     return 1;
 }
 static uint32_t k_PulseEvent(CPU *c) { rt_handle *e = h_get(ARG(0), H_EVENT); return e ? k_SetEvent_impl(e, 1) : 0; }
@@ -542,27 +585,29 @@ static uint32_t k_ReleaseMutex(CPU *c)
 {
     rt_handle *m = h_get(ARG(0), H_MUTEX);
     if (!m) return 0;
-    pthread_mutex_lock(&m->m);
-    if (m->count && --m->count == 0) { m->owner = 0; pthread_cond_broadcast(&m->cv); }
-    pthread_mutex_unlock(&m->m);
+    rt_cond_lock(&m->wake);
+    if (m->count && --m->count == 0) { m->owner = 0; rt_cond_broadcast(&m->wake); }
+    rt_cond_unlock(&m->wake);
     return 1;
 }
 static int wait_until(rt_handle *h, uint32_t ms, int (*ready)(rt_handle *, uint32_t), uint32_t tid)
 {
-    struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    uint64_t ns = (uint64_t)dl.tv_nsec + (uint64_t)ms * 1000000ULL;
-    dl.tv_sec += (time_t)(ns / 1000000000ULL);
-    dl.tv_nsec = (long)(ns % 1000000000ULL);
-    pthread_mutex_lock(&h->m);
+    uint64_t deadline = rt_now_us() + (uint64_t)ms * 1000U;
+    rt_cond_lock(&h->wake);
     uint32_t pulses = h->pulses;
     /* A PulseEvent releases the threads already waiting, without leaving the event signaled. */
     while (!ready(h, tid) && h->pulses == pulses) {
-        if (ms == 0) { pthread_mutex_unlock(&h->m); return 0; }
-        if (ms == 0xFFFFFFFFU) pthread_cond_wait(&h->cv, &h->m);
-        else if (pthread_cond_timedwait(&h->cv, &h->m, &dl) == ETIMEDOUT && !ready(h, tid) && h->pulses == pulses) { pthread_mutex_unlock(&h->m); return 0; }
+        if (ms == 0) { rt_cond_unlock(&h->wake); return 0; }
+        if (ms == 0xFFFFFFFFU) {
+            rt_cond_wait_ms(&h->wake, 0xFFFFFFFFU);
+            continue;
+        }
+        uint64_t now = rt_now_us();
+        if (now >= deadline) { rt_cond_unlock(&h->wake); return 0; }
+        uint32_t left = (uint32_t)((deadline - now + 999U) / 1000U);
+        rt_cond_wait_ms(&h->wake, left ? left : 1);
     }
-    pthread_mutex_unlock(&h->m);
+    rt_cond_unlock(&h->wake);
     return 1;
 }
 static int ev_ready(rt_handle *h, uint32_t tid) { (void)tid; if (!h->signaled) return 0; if (!h->manual) h->signaled = 0; return 1; }
@@ -581,26 +626,40 @@ static uint32_t k_WaitForSingleObject(CPU *c)
 static void *thread_main(void *arg)
 {
     rt_handle *h = arg;
-    cur = h->tctx;
-    CPU *c = &cur->cpu;
+    rt_thread_ctx *x = h->tctx;
+    rt_thread_place_self(0, x->win_prio);
+    x->os_id = rt_thread_os_id();
+    CPU *c = &x->cpu;
     uint32_t a[1] = { h->param };
     rt_call_guest(c, h->start, 1, a);
-    pthread_mutex_lock(&h->m);
+    rt_cond_lock(&h->wake);
     h->signaled = 1;
-    pthread_cond_broadcast(&h->cv);
-    pthread_mutex_unlock(&h->m);
+    rt_cond_broadcast(&h->wake);
+    rt_cond_unlock(&h->wake);
     return NULL;
 }
+/* Translated code keeps every guest call on the native stack, so host threads get a large one. */
+#define HOST_THREAD_STACK (4U << 20)
+static void start_host_thread(pthread_t *th, void *(*fn)(void *), void *arg)
+{
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, HOST_THREAD_STACK);
+    pthread_create(th, &a, fn, arg);
+    pthread_attr_destroy(&a);
+}
+static void start_guest_thread(rt_handle *t) { start_host_thread(&t->thread, thread_main, t); }
+
 /* A guest thread context: CPU, guest stack and TEB. */
 static rt_thread_ctx *new_thread_ctx(uint32_t stack)
 {
     rt_thread_ctx *t = calloc(1, sizeof *t);
-    pthread_mutex_init(&t->m, NULL);
-    pthread_cond_init(&t->cv, NULL);
+    rt_cond_init(&t->wake);
     pthread_mutex_lock(&big);
     uint32_t base = rt_alloc(stack + 0x1000U);
     uint32_t teb = rt_alloc(0x1000U);
     t->tid = ++next_tid;
+    if (ctx_count < MAX_CTX) all_ctx[ctx_count++] = t;
     pthread_mutex_unlock(&big);
     memset(G2H(teb), 0, 0x1000);
     st32(teb + 0x00, 0xFFFFFFFFU); st32(teb + 0x04, base + stack); st32(teb + 0x08, base);
@@ -625,59 +684,84 @@ static uint32_t k_CreateThread(CPU *c)
     if (ARG(5)) st32(ARG(5), t->tctx->tid);
     rt_log("[w32] CreateThread(start %08x, param %08x, flags %x) -> tid %u\n", t->start, t->param, ARG(4), t->tctx->tid);
     if (ARG(4) & 4U) { t->suspended = 1; t->tctx->suspend = 1; }
-    else pthread_create(&t->thread, NULL, thread_main, t);
+    else start_guest_thread(t);
     return h;
 }
-/* Suspend counts as on Windows: a thread suspended by itself blocks at once, one suspended by another stops at its next API call (rt_safepoint). */
-static rt_thread_ctx *ctx_of(uint32_t h, rt_handle **th)
+/* Suspend counts as on Windows: a thread suspended by itself blocks at once, one suspended by another stops at its next API call
+ * (rt_safepoint) made outside every critical section. Windows stops it on the spot; stopping later while it holds a lock would
+ * deadlock whoever waits for that lock (seen on the Vita: CRI ADX's timer waiting on a suspended worker's critical section). */
+static rt_thread_ctx *ctx_of(CPU *c, uint32_t h, rt_handle **th)
 {
     *th = NULL;
-    if (h == 0xFFFFFFFEU) return cur;
+    if (h == 0xFFFFFFFEU) return ctx_of_cpu(c);
     rt_handle *t = h_get(h, H_THREAD);
     *th = t;
     return t ? t->tctx : NULL;
 }
 static void block_while_suspended(rt_thread_ctx *x)
 {
-    pthread_mutex_lock(&x->m);
-    while (x->suspend > 0) pthread_cond_wait(&x->cv, &x->m);
-    pthread_mutex_unlock(&x->m);
+    rt_cond_lock(&x->wake);
+    while (x->suspend > 0) rt_cond_wait_ms(&x->wake, 0xFFFFFFFFU);
+    rt_cond_unlock(&x->wake);
 }
-void rt_safepoint(void)
+static const rt_thunk *no_ctx_thunk;
+/* Called on every API call: records the thunk being called (COM dispatch reads it) and stops a suspended thread. */
+void rt_safepoint(CPU *c, const rt_thunk *t)
 {
-    if (cur && cur->suspend > 0) block_while_suspended(cur);
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    if (!x) { no_ctx_thunk = t; return; }
+    x->thunk = t;
+    if (x->suspend > 0 && x->cs_held == 0) block_while_suspended(x);
+}
+const rt_thunk *rt_current_thunk(CPU *c)
+{
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    return x ? x->thunk : no_ctx_thunk;
 }
 static uint32_t k_ResumeThread(CPU *c)
 {
     rt_handle *t;
-    rt_thread_ctx *x = ctx_of(ARG(0), &t);
+    rt_thread_ctx *x = ctx_of(c, ARG(0), &t);
     if (!x) return 0xFFFFFFFFU;
-    pthread_mutex_lock(&x->m);
+    rt_cond_lock(&x->wake);
     int prev = x->suspend;
     if (x->suspend > 0) x->suspend--;
     int run = x->suspend == 0;
-    pthread_cond_broadcast(&x->cv);
-    pthread_mutex_unlock(&x->m);
-    if (run && t && t->suspended) { t->suspended = 0; pthread_create(&t->thread, NULL, thread_main, t); }
+    rt_cond_broadcast(&x->wake);
+    rt_cond_unlock(&x->wake);
+    if (run && t && t->suspended) { t->suspended = 0; start_guest_thread(t); }
     return (uint32_t)prev;
 }
 static uint32_t k_SuspendThread(CPU *c)
 {
     rt_handle *t;
-    rt_thread_ctx *x = ctx_of(ARG(0), &t);
+    rt_thread_ctx *x = ctx_of(c, ARG(0), &t);
     if (!x) return 0xFFFFFFFFU;
-    pthread_mutex_lock(&x->m);
+    rt_cond_lock(&x->wake);
     int prev = x->suspend++;
-    pthread_mutex_unlock(&x->m);
-    if (x == cur) {
+    rt_cond_unlock(&x->wake);
+    if (x == ctx_of_cpu(c)) {
         c->eax = (uint32_t)prev;
         block_while_suspended(x);
     }
     return (uint32_t)prev;
 }
 static uint32_t k_ExitThread(CPU *c) { (void)c; pthread_exit(NULL); return 0; }
-static uint32_t k_SetThreadPriority(CPU *c) { (void)c; return 1; }
-static uint32_t k_GetThreadPriority(CPU *c) { (void)c; return 0; }
+static uint32_t k_SetThreadPriority(CPU *c)
+{
+    rt_handle *t;
+    rt_thread_ctx *x = ctx_of(c, ARG(0), &t);
+    if (!x) return 0;
+    x->win_prio = (int)ARG(1);
+    if (x->os_id) rt_thread_set_priority(x->os_id, x->win_prio);
+    return 1;
+}
+static uint32_t k_GetThreadPriority(CPU *c)
+{
+    rt_handle *t;
+    rt_thread_ctx *x = ctx_of(c, ARG(0), &t);
+    return x ? (uint32_t)x->win_prio : 0;
+}
 static uint32_t k_SetThreadAffinityMask(CPU *c) { (void)c; return 1; }
 static uint32_t k_SetThreadPriorityBoost(CPU *c) { (void)c; return 1; }
 
@@ -689,7 +773,7 @@ static uint32_t k_RaiseException(CPU *c) { rt_log("[w32] RaiseException(%08x)\n"
 static uint32_t k_RtlUnwind(CPU *c)
 {
     /* Pop SEH registrations down to the target frame; the return value is passed through. */
-    uint32_t teb = rt_current_teb(), frame = ARG(0);
+    uint32_t teb = rt_current_teb(c), frame = ARG(0);
     if (frame) st32(teb, frame); else st32(teb, 0xFFFFFFFFU);
     c->eax = ARG(3);
     return ARG(3);
@@ -721,53 +805,77 @@ static uint32_t w_timeGetTime(CPU *c) { (void)c; return (uint32_t)(now_us() / 10
 static uint32_t w_timeBeginPeriod(CPU *c) { (void)c; return 0; }
 static uint32_t w_timeGetDevCaps(CPU *c) { st32(ARG(0), 1); st32(ARG(0) + 4, 1000000); return 0; }
 
-/* timeSetEvent: a host thread per timer that signals the event or calls the guest TimeProc on its own guest context. */
+/* timeSetEvent: one persistent host thread per timer slot, woken when the slot is armed; it signals the event or calls the guest
+ * TimeProc on its own guest context. The game re-arms a one-shot timer every ~15 ms: a new host thread each time was slow on the
+ * Vita and hung there at the new thread's first thread-local access. */
 typedef struct rt_timer {
     uint32_t id, delay, cb, user, flags;
     volatile int active, running;
+    int started;
     pthread_t thread;
     rt_thread_ctx *ctx;
+    rt_cond arm;
 } rt_timer;
 #define MAX_TIMERS 16
 static rt_timer timers[MAX_TIMERS];
+static uint32_t timer_arms;
 
 static void *timer_main(void *arg)
 {
     rt_timer *t = arg;
-    cur = t->ctx;
-    uint64_t next = now_us();
-    do {
-        next += (uint64_t)t->delay * 1000U;
-        uint64_t now = now_us();
-        if (next > now) usleep((useconds_t)(next - now));
-        else next = now;
-        if (!t->active) break;
-        if (t->flags & 0x30U) {
-            rt_handle *e = h_get(t->cb, H_EVENT);
-            if (e) k_SetEvent_impl(e, (t->flags & 0x20U) != 0);
-        } else {
-            uint32_t a[5] = { t->id, 0, t->user, 0, 0 };
-            rt_call_guest(&t->ctx->cpu, t->cb, 5, a);
-        }
-    } while (t->active && (t->flags & 1U));
-    t->active = 0;
-    t->running = 0;
+    /* Windows runs multimedia timer callbacks at time-critical priority. */
+    rt_thread_place_self(0, 15);
+    for (;;) {
+        rt_cond_lock(&t->arm);
+        while (!t->running) rt_cond_wait_ms(&t->arm, 0xFFFFFFFFU);
+        rt_cond_unlock(&t->arm);
+        uint64_t next = now_us();
+        do {
+            next += (uint64_t)t->delay * 1000U;
+            uint64_t now = now_us();
+            if (next > now) rt_sleep_us(next - now);
+            else next = now;
+            if (!t->active) break;
+            if (t->flags & 0x30U) {
+                rt_handle *e = h_get(t->cb, H_EVENT);
+                if (e) k_SetEvent_impl(e, (t->flags & 0x20U) != 0);
+            } else {
+                uint32_t a[5] = { t->id, 0, t->user, 0, 0 };
+                rt_call_guest(&t->ctx->cpu, t->cb, 5, a);
+            }
+        } while (t->active && (t->flags & 1U));
+        rt_cond_lock(&t->arm);
+        t->active = 0;
+        t->running = 0;
+        rt_cond_unlock(&t->arm);
+    }
     return NULL;
 }
 static uint32_t w_timeSetEvent(CPU *c)
 {
+    pthread_mutex_lock(&big);
     for (uint32_t i = 0; i < MAX_TIMERS; i++) {
         rt_timer *t = &timers[i];
         if (t->active || t->running) continue;
+        if (!t->ctx) { t->ctx = new_thread_ctx(256U << 10); rt_cond_init(&t->arm); }
+        rt_cond_lock(&t->arm);
         t->id = i + 1; t->delay = ARG(0) ? ARG(0) : 1; t->cb = ARG(2); t->user = ARG(3); t->flags = ARG(4);
-        if (!t->ctx) t->ctx = new_thread_ctx(256U << 10);
         t->active = 1;
         t->running = 1;
-        rt_log("[w32] timeSetEvent(%u ms, %s %08x, flags %x) -> %u\n", t->delay, (t->flags & 0x30U) ? "event" : "proc", t->cb, t->flags, t->id);
-        pthread_create(&t->thread, NULL, timer_main, t);
-        pthread_detach(t->thread);
+        rt_cond_broadcast(&t->arm);
+        rt_cond_unlock(&t->arm);
+        if (!t->started) {
+            t->started = 1;
+            start_host_thread(&t->thread, timer_main, t);
+            pthread_detach(t->thread);
+        }
+        pthread_mutex_unlock(&big);
+        /* The game re-arms every frame or so: only the first arms are logged. */
+        if (++timer_arms <= 8)
+            rt_log("[w32] timeSetEvent(%u ms, %s %08x, flags %x) -> %u\n", t->delay, (t->flags & 0x30U) ? "event" : "proc", t->cb, t->flags, t->id);
         return t->id;
     }
+    pthread_mutex_unlock(&big);
     (void)c;
     return 0;
 }
@@ -789,7 +897,7 @@ static uint32_t u_GetSystemMetrics(CPU *c) { return ARG(0) == 0 ? 1024 : ARG(0) 
 static uint32_t u_Rect(CPU *c)
 {
     int w = 640, h = 480;
-    plat_screen_size(&w, &h);
+    plat_game_size(&w, &h);
     if (w <= 0 || h <= 0) { w = 640; h = 480; }
     st32(ARG(1), 0); st32(ARG(1) + 4, 0); st32(ARG(1) + 8, (uint32_t)w); st32(ARG(1) + 12, (uint32_t)h);
     return 1;
@@ -913,14 +1021,57 @@ const rt_thunk *rt_find_import(const char *name)
     return t;
 }
 
+int rt_watchdog_on;
+void rt_note_function(CPU *c, uint32_t rva)
+{
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    if (!x) return;
+    x->fn_ring[x->fn_calls & 7U] = rva + GUEST_IMAGE_BASE;
+    x->fn_calls++;
+}
+void rt_note_import(CPU *c, const char *name, int stage)
+{
+    rt_thread_ctx *x = ctx_of_cpu(c);
+    if (!x) return;
+    if (stage == 1) { x->last_import = name; x->import_calls++; }
+    x->stage = stage;
+}
+
+/* TMNT_WATCHDOG=1: every 2 s, each guest thread's last API call, call count and suspend count (finds hangs where no log is written). */
+extern uint32_t rt_last_guest_call(void);
+static void *watchdog_main(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(0, 15);
+    for (;;) {
+        rt_sleep_us(2000000);
+        rt_log("[watchdog] last indirect call %08x\n", rt_last_guest_call());
+        for (int i = 0; i < ctx_count; i++) {
+            rt_thread_ctx *x = all_ctx[i];
+            uint32_t n = x->fn_calls, w = x->waiting_cs, wid = w ? ld32(w) : 0;
+            rt_log("[watchdog] tid %u: %u calls, last %s (stage %d), suspend %d, critical sections %d, waiting cs %08x (owner %u), esp %08x; "
+                   "%u functions, last %08x %08x %08x %08x\n",
+                   x->tid, x->import_calls, x->last_import ? x->last_import : "-", x->stage, x->suspend, x->cs_held, w,
+                   wid && wid <= MAX_CS ? cs_owner[wid - 1] : 0, x == &main_ctx && main_cpu ? main_cpu->esp : x->cpu.esp, n,
+                   x->fn_ring[(n - 1) & 7U], x->fn_ring[(n - 2) & 7U], x->fn_ring[(n - 3) & 7U], x->fn_ring[(n - 4) & 7U]);
+        }
+    }
+    return NULL;
+}
+
 void rt_win32_init(CPU *__restrict c)
 {
-    (void)c;
+    main_cpu = c;
+    rt_watchdog_on = getenv("TMNT_WATCHDOG") && atoi(getenv("TMNT_WATCHDOG"));
     main_ctx.tid = 1000;
     main_ctx.teb = GUEST_TEB;
-    pthread_mutex_init(&main_ctx.m, NULL);
-    pthread_cond_init(&main_ctx.cv, NULL);
-    cur = &main_ctx;
+    rt_cond_init(&main_ctx.wake);
+    all_ctx[ctx_count++] = &main_ctx;
+    if (getenv("TMNT_WATCHDOG") && atoi(getenv("TMNT_WATCHDOG"))) {
+        pthread_t w;
+        start_host_thread(&w, watchdog_main, NULL);
+        pthread_detach(w);
+    }
     cmdline_ptr = guest_strdup("TMNT.EXE");
     env_ptr = rt_alloc(4);
     st32(env_ptr, 0);
