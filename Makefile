@@ -2,11 +2,11 @@
 GEN := recomp/out/c
 OBJ := build/mac/obj
 CC := clang
-GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 -DGUEST_GPR_LOCAL=1
+GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 -DGUEST_GPR_LOCAL=1 -DGUEST_X87_LOCAL=1 -DGUEST_MEMBASE_LOCAL=1 -DGUEST_FLAGS_LOCAL=1
 RTFLAGS := -O1 -g -Wall -Wno-unused-function -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 $(shell sdl2-config --cflags)
 
 GEN_SRC := $(wildcard $(GEN)/guest_*.c) $(GEN)/dispatch.c $(GEN)/imports.c
-RT_SRC := rt/runtime.c rt/win32.c rt/com.c rt/d3d9.c rt/d3d9_gl.c rt/plat_sdl.c rt/dinput.c rt/dsound.c rt/game_tmnt.c
+RT_SRC := rt/runtime.c rt/win32.c rt/com.c rt/d3d9.c rt/d3d9_gl.c rt/plat_sdl.c rt/dinput.c rt/dsound.c rt/game_tmnt.c rt/movie.c rt/par.c
 GEN_OBJ := $(patsubst $(GEN)/%.c,$(OBJ)/gen/%.o,$(GEN_SRC))
 RT_OBJ := $(patsubst rt/%.c,$(OBJ)/rt/%.o,$(RT_SRC))
 

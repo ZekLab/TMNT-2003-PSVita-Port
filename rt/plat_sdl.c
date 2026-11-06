@@ -309,3 +309,5 @@ int plat_audio_start(void (*mix)(int16_t *out, int frames))
     rt_log("[plat] audio %d Hz, %d ch, %d samples\n", have.freq, have.channels, have.samples);
     return have.freq;
 }
+
+void plat_power_info(int *arm, int *gpu, int *battery) { *arm = *gpu = *battery = 0; }

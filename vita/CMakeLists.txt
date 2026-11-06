@@ -20,7 +20,7 @@ endif()
 file(GLOB GUEST_SOURCES CONFIGURE_DEPENDS "${GEN}/guest_*.c")
 set(RT_SOURCES
     ${ROOT}/rt/runtime.c ${ROOT}/rt/win32.c ${ROOT}/rt/com.c ${ROOT}/rt/d3d9.c ${ROOT}/rt/d3d9_gl.c
-    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c)
+    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c ${ROOT}/rt/movie.c ${ROOT}/rt/par.c)
 
 set(COMMON_FLAGS -std=gnu11 -O2 -mtune=cortex-a9 -mfpu=neon -fno-strict-aliasing)
 
@@ -28,7 +28,7 @@ set(COMMON_FLAGS -std=gnu11 -O2 -mtune=cortex-a9 -mfpu=neon -fno-strict-aliasing
 add_library(guest STATIC ${GUEST_SOURCES} ${GEN}/dispatch.c ${GEN}/imports.c)
 target_compile_options(guest PRIVATE ${COMMON_FLAGS} -w)
 # Guest registers in locals (guest.h GUEST_GPR_LOCAL): with them in the CPU struct GCC reloads them after every guest store.
-target_compile_definitions(guest PRIVATE GUEST_GENERATED_STACK_GUARD=0 GUEST_GPR_LOCAL=1)
+target_compile_definitions(guest PRIVATE GUEST_GENERATED_STACK_GUARD=0 GUEST_GPR_LOCAL=1 GUEST_X87_LOCAL=1 GUEST_MEMBASE_LOCAL=1 GUEST_FLAGS_LOCAL=1)
 target_include_directories(guest PRIVATE ${ROOT}/rt)
 
 add_executable(TMNTVita ${RT_SOURCES})
@@ -37,6 +37,11 @@ target_compile_definitions(TMNTVita PRIVATE GUEST_GENERATED_STACK_GUARD=0)
 target_include_directories(TMNTVita PRIVATE ${ROOT}/rt)
 # vita-elf-create appends SCE data after the text segment; headroom avoids failures near a 64 KB boundary (Rogue Squadron).
 target_link_options(TMNTVita PRIVATE -Wl,--defsym=__sce_headroom=0x2000)
+
+# vitaGL built here with NO_DEBUG=1 HAVE_SHADER_CACHE=1 (build/vitagl), when present, before the SDK's copy.
+if (EXISTS ${ROOT}/build/vitagl/libvitaGL.a)
+    target_link_directories(TMNTVita PRIVATE ${ROOT}/build/vitagl)
+endif()
 
 target_link_libraries(TMNTVita PRIVATE
     guest
@@ -56,6 +61,7 @@ target_link_libraries(TMNTVita PRIVATE
     SceAudio_stub
     ScePower_stub
     SceSysmodule_stub
+    SceVideodec_stub
     SceIofilemgr_stub
     stdc++
     pthread
@@ -69,7 +75,17 @@ set(VITA_VERSION "00.01")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 vita_create_self(eboot.bin TMNTVita UNSAFE)
+# Bubble icon and LiveArea are built locally from the game's art (tools/vita/livearea_from_art.py); without them the VPK gets the system defaults.
+set(LIVEAREA_FILES)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg0.png AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/frame1.png)
+    foreach(file icon0.png livearea/contents/bg0.png livearea/contents/frame1.png livearea/contents/startup.png livearea/contents/template.xml)
+        list(APPEND LIVEAREA_FILES FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/${file} sce_sys/${file})
+    endforeach()
+else()
+    message(STATUS "No LiveArea images in vita/sce_sys; run tools/vita/livearea_from_art.py to add them")
+endif()
 vita_create_vpk(TMNTVita.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
     NAME "TMNT"
+    ${LIVEAREA_FILES}
 )

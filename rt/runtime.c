@@ -17,6 +17,7 @@
 #include "guest.h"
 #include "osdep.h"
 #include "runtime.h"
+#include "par.h"
 
 uint8_t *guest_membase;
 uint32_t g_guest_fs_base_cached;
@@ -144,6 +145,10 @@ static int watch_functions;
 /* TMNT_PROF=1: where the main thread's time goes, reported with the frame line (rt_prof_report). Host API time per import/COM
  * method, and a sampling profile of the translated function the main thread last entered (sampled every 500 us on another core). */
 static int prof_on;
+/* TMNT_FNSET=1: every translated function the main thread enters is marked; each report window (rt_prof_report) is written to
+ * fnset_<frame>.txt, one RVA per line. Diffing two windows finds the code of one screen (e.g. a menu page). */
+static int fnset_on;
+static uint8_t fnset_bits[0x200000 / 8];
 static CPU *prof_cpu;
 static volatile uint32_t prof_cur_fn;
 static uint64_t prof_thunk_us[RT_MAX_THUNKS];
@@ -164,12 +169,14 @@ static void trace_init(void)
     }
     watch_functions = getenv("TMNT_WATCHDOG") && atoi(getenv("TMNT_WATCHDOG"));
     prof_on = getenv("TMNT_PROF") && atoi(getenv("TMNT_PROF"));
-    guest_trace_on = trace_count > 0 || watch_functions || prof_on;
+    fnset_on = getenv("TMNT_FNSET") && atoi(getenv("TMNT_FNSET"));
+    guest_trace_on = trace_count > 0 || watch_functions || prof_on || fnset_on;
 }
 
 void guest_trace_enter(CPU *c, uint32_t rva)
 {
     if (prof_on && c == prof_cpu) prof_cur_fn = rva;
+    if (fnset_on && c == prof_cpu && rva < 0x200000U) fnset_bits[rva >> 3] |= (uint8_t)(1U << (rva & 7U));
     if (watch_functions) rt_note_function(c, rva);
     for (int i = 0; i < trace_count; i++) {
         if (trace_rvas[i] == rva) {
@@ -277,9 +284,77 @@ void rt_selftest_pow(CPU *c)
     c->st_top = saved_top;
 }
 
+/* TMNT_SELFTEST_BLOCKS=rva,in.bin,out.bin: runs a translated cdecl (block, n) function on every record of in.bin
+   (int32 n + 64 int16 coefficients) and writes the blocks it leaves; compared offline with the x86 run in Unicorn. */
+void rt_selftest_blocks(CPU *c, const char *spec)
+{
+    char in[512], out[512];
+    unsigned rva;
+    if (sscanf(spec, "%x,%511[^,],%511s", &rva, in, out) != 3) { rt_log("[selftest] bad TMNT_SELFTEST_BLOCKS\n"); return; }
+    FILE *fi = fopen(in, "rb"), *fo = fopen(out, "wb");
+    if (!fi || !fo) { rt_log("[selftest] cannot open %s / %s\n", in, out); return; }
+    uint32_t buf = rt_alloc(128);
+    int32_t n;
+    int16_t blk[64];
+    int count = 0;
+    while (fread(&n, 4, 1, fi) == 1 && fread(blk, 2, 64, fi) == 64) {
+        memcpy(G2H(buf), blk, 128);
+        uint32_t a[2] = { buf, (uint32_t)n };
+        call_cdecl(c, rva, 2, a);
+        memcpy(blk, G2H(buf), 128);
+        fwrite(blk, 2, 64, fo);
+        count++;
+    }
+    fclose(fi); fclose(fo);
+    rt_free(buf);
+    rt_log("[selftest] blocks: %d records through %08x\n", count, rva);
+}
+
+/* TMNT_SELFTEST_MC=out.bin: Sofdec's plain motion compensation (struct: +0x18 dst, +0x20 pitch, +0x24 src A, +0x28 src B) on a
+   64 KB arena of xorshift bytes, for every source alignment; each record is (rva, align, arena address) + the arena after the
+   call, replayed in Unicorn by build/analysis/idct/uc_mc.py. */
+void rt_selftest_mc(CPU *c, const char *path)
+{
+    static const uint32_t fns[] = { 0x586ee0, 0x5872f0, 0x5873c0, 0x587480 };
+    FILE *fo = fopen(path, "wb");
+    if (!fo) return;
+    uint32_t arena = rt_alloc(0x10000);
+    for (unsigned f = 0; f < sizeof fns / sizeof fns[0]; f++)
+        for (uint32_t align = 0; align < 8; align++) {
+            uint32_t x = 0x9e3779b9U ^ (f * 8 + align);
+            uint8_t *m = G2H(arena);
+            for (int i = 0; i < 0x10000; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; m[i] = (uint8_t)x; }
+            st32(arena + 0x18, arena + 0x6000); st32(arena + 0x20, 0x40);
+            st32(arena + 0x24, arena + 0x1000 + align); st32(arena + 0x28, arena + 0x3000 + align);
+            uint32_t a[1] = { arena };
+            call_cdecl(c, fns[f], 1, a);
+            uint32_t hdr[3] = { fns[f], align, arena };
+            fwrite(hdr, 4, 3, fo);
+            fwrite(G2H(arena), 1, 0x10000, fo);
+        }
+    fclose(fo);
+    rt_free(arena);
+    rt_log("[selftest] mc: wrote %s\n", path);
+}
+
 /* ------------------------------------------------------------ dispatch --- */
 
+/* Indirect calls: RVA -> translated function through an open-addressing table filled once before any guest code runs (read-only
+ * afterwards, so guest threads share it without locks); about one probe per call against ~14 for the binary search. */
+#define LOOKUP_BITS 15
+static struct { uint32_t rva; guest_fn fn; } lookup_tab[1U << LOOKUP_BITS];
+
+static uint32_t lookup_slot(uint32_t rva) { return (rva * 2654435761U) >> (32 - LOOKUP_BITS); }
+
 static guest_fn lookup(uint32_t rva)
+{
+    for (uint32_t h = lookup_slot(rva); lookup_tab[h].rva; h = (h + 1) & ((1U << LOOKUP_BITS) - 1))
+        if (lookup_tab[h].rva == rva) return lookup_tab[h].fn;
+    return NULL;
+}
+
+/* The sorted-table search the hash table replaced; TMNT_SELFTEST=1 checks both agree. */
+static guest_fn lookup_sorted(uint32_t rva)
 {
     uint32_t lo = 0, hi = guest_func_count;
     while (lo < hi) {
@@ -290,6 +365,25 @@ static guest_fn lookup(uint32_t rva)
             hi = mid;
     }
     return (lo < guest_func_count && guest_func_rvas[lo] == rva) ? guest_func_ptrs[lo] : NULL;
+}
+
+static void lookup_init(void)
+{
+    for (uint32_t i = 0; i < guest_func_count; i++) {
+        uint32_t h = lookup_slot(guest_func_rvas[i]);
+        while (lookup_tab[h].rva) h = (h + 1) & ((1U << LOOKUP_BITS) - 1);
+        lookup_tab[h].rva = guest_func_rvas[i];
+        lookup_tab[h].fn = guest_func_ptrs[i];
+    }
+    if (getenv("TMNT_SELFTEST")) {
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < guest_func_count; i++) {
+            uint32_t r = guest_func_rvas[i];
+            if (lookup(r) != lookup_sorted(r)) bad++;
+            if (lookup(r + 1U) != lookup_sorted(r + 1U)) bad++;   /* mostly addresses inside a function: both must miss */
+        }
+        rt_log("[selftest] dispatch table: %u functions, %u mismatches\n", guest_func_count, bad);
+    }
 }
 
 #define CALLSTACK_DEPTH 64
@@ -394,8 +488,21 @@ static void *prof_sampler(void *arg)
 }
 
 /* Logs the heaviest host API calls (per frame over `frames`) and translated functions, then starts a new window. */
+static uint32_t fnset_window;
+static void fnset_dump(void)
+{
+    char name[48];
+    snprintf(name, sizeof name, "fnset_%05u.txt", ++fnset_window);
+    FILE *f = fopen(name, "w");
+    for (uint32_t i = 0; f && i < sizeof fnset_bits * 8U; i++)
+        if (fnset_bits[i >> 3] & (1U << (i & 7U))) fprintf(f, "%08x\n", i + GUEST_IMAGE_BASE);
+    if (f) fclose(f);
+    memset(fnset_bits, 0, sizeof fnset_bits);
+}
+
 void rt_prof_report(uint32_t frames)
 {
+    if (fnset_on && frames) fnset_dump();
     if (!prof_on || !frames) return;
     for (int r = 0; r < 10; r++) {
         uint32_t best = 0;
@@ -705,6 +812,8 @@ static int game_main(int argc, char **argv)
         pthread_create(&ps, NULL, prof_sampler, NULL);
         pthread_detach(ps);
     }
+    lookup_init();
+    par_init();
     if (getenv("TMNT_SELFTEST")) { selftest(c); return 0; }
 
     gpush_generated(c, 0xFFFFFFF0U);

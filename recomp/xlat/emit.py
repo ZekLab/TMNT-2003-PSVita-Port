@@ -17,6 +17,7 @@ from trans import (CC, DIRECT, R8H, R8L, R16, R32, ST, XMMR, Unsupported,
                    _reg_root,
                    norm_cc)
 import sse_lower
+import trans as _T
 
 CTY = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 STY = {1: "int8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}
@@ -1123,9 +1124,10 @@ class Emitter:
                     return [inlined]
                 # The callee reads and writes the CPU's registers: publish the
                 # locals before the call and take back what it left behind.
+                load = " GUEST_FLAGS_LOAD(c);" if ins.address in getattr(self, "call_flag_reads", {}) else ""
                 return ["GPUSH(0x%xU); GUEST_STACK_CALLSITE_BARRIER();"
-                        " GUEST_GPR_FLUSH(c); sub_%08x(c); GUEST_GPR_RELOAD(c);"
-                        % (ins.address + ins.size, o.imm)]
+                        " GUEST_GPR_FLUSH(c); sub_%08x(c); GUEST_GPR_RELOAD(c);%s"
+                        % (ins.address + ins.size, o.imm, load)]
             self.indirect += 1
             # x86 resolves an indirect CALL target before pushing the return
             # address.  Reading it after gpush is observably wrong for an
@@ -1167,14 +1169,16 @@ class Emitter:
             # `ret 0x10` is how the Windows build revealed that PickOutcome
             # takes its RNG BY VALUE -- so this operand is load-bearing, not
             # bookkeeping.
+            # A `ret` whose flags the caller reads publishes them (trans.FLAG_RETURN_RETS).
+            flush = "GUEST_FLAGS_FLUSH(c); " if ins.address in _T.FLAG_RETURN_RETS else ""
             if ops:
                 return ["(void)GPOP();",
                         "if (!GESP_ADJ(%dU)) return;" % ops[0].imm,
                         "GUEST_STACK_CALLSITE_BARRIER();",
-                        "GUEST_GPR_FLUSH(c); return;"]
+                        flush + "GUEST_GPR_FLUSH(c); return;"]
             return ["(void)GPOP();",
                     "GUEST_STACK_CALLSITE_BARRIER();",
-                    "GUEST_GPR_FLUSH(c); return;"]
+                    flush + "GUEST_GPR_FLUSH(c); return;"]
         if m == "int3":
             return ["GUEST_GPR_FLUSH(c); guest_int3(c, 0x%xU);"
                     " GUEST_GPR_RELOAD(c);" % ins.address]

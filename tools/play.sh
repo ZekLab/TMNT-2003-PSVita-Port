@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs the Mac build of the translated game (sound with AUDIO=1); the log is run_user.log, older ones are kept in logs/.
+# Runs the Mac build of the translated game (sound on, AUDIO=0 turns it off); the log is run_user.log, older ones are kept in logs/.
 cd "$(dirname "$0")/.."
 mkdir -p logs
 [ -f run_user.log ] && mv run_user.log "logs/run_user_$(date +%Y%m%d_%H%M%S).log"

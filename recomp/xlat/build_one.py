@@ -66,6 +66,22 @@ def translate(ctx, start, name, known=None, extra_entries=(),
     # Flags reaching the entry block from outside can only arrive through an
     # external tail transfer; a unit holding flags in locals must load them.
     em.entry_flags_live = bool(live_in.get(block_of.get(start)))
+    # Flags read after a call before any write: the callee must return them (T.FLAG_RETURN_RETS); gen_c.py checks the targets
+    # and the emitter loads the flag state after these calls.
+    em.call_flag_reads = {}
+    for b, rvas in members.items():
+        for i, rva in enumerate(rvas):
+            if insns[rva].mnemonic != "call":
+                continue
+            reads, written = set(), set()
+            for r in rvas[i + 1:]:
+                reads |= T.flags_read(insns[r]) - written
+                written |= T.flags_written(insns[r])
+            if written != set("CZSOP"):
+                for s in succs.get(b, ()):
+                    reads |= live_in[s] - written
+            if reads:
+                em.call_flag_reads[rva] = reads
     # Which scalar xmm loads may skip their upper-lane zero fill: decided by
     # following each loaded value through the block graph (emit.py).
     em.xmm_zero_elide = E.xmm_zero_fill_elidable(

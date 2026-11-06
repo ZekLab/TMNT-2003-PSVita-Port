@@ -16,3 +16,6 @@ __pycache__/
 *.pid
 # Unused copy of the repentogxm runtime.
 /rt/guest.c
+# LiveArea images made from the game's copyrighted art (tools/vita/livearea_from_art.py).
+/vita/sce_sys/icon0.png
+/vita/sce_sys/livearea/contents/*.png

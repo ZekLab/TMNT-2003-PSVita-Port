@@ -1315,6 +1315,40 @@ static inline double fround(CPU *__restrict c, double v)
     }
 }
 
+/* x87 stack in locals (generated units, GUEST_X87_LOCAL=1, used with GUEST_GPR_LOCAL=1; TMNT port).
+ * gen_c.py rewrites a function that uses the x87 stack to XPUSH/XPOP/XST and the GUEST_X87_GPR_* seams. The ring is held in
+ * eight locals rotated so that local slot 0 is the physical top at the last load: _xb is that physical top, _xt the top relative
+ * to it. _xt starts at 0 and only moves by constants, so GCC resolves most slot indices at compile time and keeps the stack in
+ * VFP registers instead of reloading c->st after every guest store (which may alias it under -fno-strict-aliasing). The ring
+ * semantics are unchanged: physical slot (_xb + k) & 7 is local slot k. Every seam that publishes the general registers
+ * (calls, returns, faults) publishes the stack too, and every reload reloads it. */
+#if defined(GUEST_X87_LOCAL) && GUEST_X87_LOCAL
+#define GUEST_X87_DECL \
+    double _x87[8]; unsigned _xb = (unsigned)c->st_top & 7U, _xt = 0; \
+    for (int _xk = 0; _xk < 8; _xk++) _x87[_xk] = c->st[(_xb + (unsigned)_xk) & 7U]
+#define GUEST_X87_FLUSH(c) \
+    ({ for (int _xk = 0; _xk < 8; _xk++) (c)->st[(_xb + (unsigned)_xk) & 7U] = _x87[_xk]; \
+       (c)->st_top = (int)((_xb + _xt) & 7U); })
+#define GUEST_X87_RELOAD(c) \
+    ({ _xb = (unsigned)(c)->st_top & 7U; _xt = 0; \
+       for (int _xk = 0; _xk < 8; _xk++) _x87[_xk] = (c)->st[(_xb + (unsigned)_xk) & 7U]; })
+#define GUEST_X87_GPR_FLUSH(c) (GUEST_X87_FLUSH(c), GUEST_GPR_FLUSH(c))
+#define GUEST_X87_GPR_RELOAD(c) (GUEST_GPR_RELOAD(c), GUEST_X87_RELOAD(c))
+#define XPUSH(v) do { double _xv = (v); _xt = (_xt - 1U) & 7U; _x87[_xt] = _xv; } while (0)
+#define XPOP() ({ double _xv = _x87[_xt]; _xt = (_xt + 1U) & 7U; _xv; })
+#define XST(i) (&_x87[(_xt + (unsigned)(i)) & 7U])
+#else
+/* Same spellings over the CPU struct, so a rewritten corpus also builds without the locals. */
+#define GUEST_X87_DECL ((void)0)
+#define GUEST_X87_GPR_FLUSH(c) GUEST_GPR_FLUSH(c)
+#define GUEST_X87_GPR_RELOAD(c) GUEST_GPR_RELOAD(c)
+#define XPUSH(v) fpush(c, v)
+#define XPOP() fpop(c)
+#define XST(i) fst(c, i)
+#define _xt ((unsigned)c->st_top)
+#define _x87 (c->st)
+#endif
+
 /* FXAM class in C3/C2/C0 plus the sign in C1 (empty registers are not modelled). */
 static inline uint16_t fxam_bits(double v)
 {
@@ -1992,6 +2026,53 @@ static inline uint32_t guest_fs_base_generated(CPU *__restrict c)
 #define GESP_SET(value) guest_stack_set_generated(c, value)
 #define GESP_ADJ(amount) guest_stack_adjust_generated(c, amount)
 #define GSTACK_ADDR(address, size) guest_stack_address_generated(c, address, size)
+#endif
+
+
+/* Generated units (GUEST_MEMBASE_LOCAL=1): the guest memory base in a function-local copy. A guest store could alias the global
+ * guest_membase under -fno-strict-aliasing, so GCC reloaded it after every store; a local whose address is never taken cannot. */
+#if defined(GUEST_MEMBASE_LOCAL) && GUEST_MEMBASE_LOCAL
+static inline uint8_t  ld8_b (uint8_t *b, uint32_t a) { return *(uint8_t  *)(b + a); }
+static inline uint16_t ld16_b(uint8_t *b, uint32_t a) { return *(uint16_t *)(b + a); }
+static inline uint32_t ld32_b(uint8_t *b, uint32_t a) { return *(uint32_t *)(b + a); }
+static inline uint64_t ld64_b(uint8_t *b, uint32_t a) { uint64_t v; memcpy(&v, b + a, 8); return v; }
+static inline xmm_t    ldx_b (uint8_t *b, uint32_t a) { xmm_t v; memcpy(&v, b + a, 16); return v; }
+static inline double   ldd_b (uint8_t *b, uint32_t a) { double v; memcpy(&v, b + a, 8); return v; }
+static inline void st8_b (uint8_t *b, uint32_t a, uint8_t  v) { *(uint8_t  *)(b + a) = v; }
+static inline void st16_b(uint8_t *b, uint32_t a, uint16_t v) { *(uint16_t *)(b + a) = v; }
+static inline void st32_b(uint8_t *b, uint32_t a, uint32_t v) { *(uint32_t *)(b + a) = v; }
+static inline void st64_b(uint8_t *b, uint32_t a, uint64_t v) { memcpy(b + a, &v, 8); }
+static inline void stx_b (uint8_t *b, uint32_t a, xmm_t    v) { memcpy(b + a, &v, 16); }
+static inline void std_b (uint8_t *b, uint32_t a, double   v) { memcpy(b + a, &v, 8); }
+#if GUEST_F32_VFP_ACCESS
+static inline float ldf_b(uint8_t *b, uint32_t a)
+{ if (GUEST_F32_MISALIGNED(a)) return guest_ldf_misaligned(a); return *(const guest_f32_word *)(b + a); }
+static inline void stf_b(uint8_t *b, uint32_t a, float v)
+{ if (GUEST_F32_MISALIGNED(a)) { guest_stf_misaligned(a, v); return; } *(guest_f32_word *)(b + a) = v; }
+#else
+static inline float ldf_b(uint8_t *b, uint32_t a) { float v; memcpy(&v, b + a, 4); return v; }
+static inline void stf_b(uint8_t *b, uint32_t a, float v) { memcpy(b + a, &v, 4); }
+#endif
+#define ld8(a) ld8_b(_mb, (a))
+#define ld16(a) ld16_b(_mb, (a))
+#define ld32(a) ld32_b(_mb, (a))
+#define ld64(a) ld64_b(_mb, (a))
+#define ldx(a) ldx_b(_mb, (a))
+#define ldd(a) ldd_b(_mb, (a))
+#define ldf(a) ldf_b(_mb, (a))
+#define st8(a, v) st8_b(_mb, (a), (v))
+#define st16(a, v) st16_b(_mb, (a), (v))
+#define st32(a, v) st32_b(_mb, (a), (v))
+#define st64(a, v) st64_b(_mb, (a), (v))
+#define stx(a, v) stx_b(_mb, (a), (v))
+#define std_(a, v) std_b(_mb, (a), (v))
+#define stf(a, v) stf_b(_mb, (a), (v))
+#undef GUEST_GPR_DECL
+#define GUEST_GPR_DECL \
+    uint8_t *const _mb = guest_membase; \
+    uint32_t GUEST_GPR_UNUSED _eax = c->eax, _ecx = c->ecx, _edx = c->edx, \
+             _ebx = c->ebx, _esp = c->esp, _ebp = c->ebp, _esi = c->esi, \
+             _edi = c->edi
 #endif
 
 #ifdef __cplusplus

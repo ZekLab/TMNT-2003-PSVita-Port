@@ -15,6 +15,10 @@ for _name in ("NORETURN_IMPORTS", "NORETURN_WRAPPERS", "NORETURN_THUNKS", "NORET
     if hasattr(T, _name):
         setattr(T, _name, {})
 
+# CRT helper 0x56b405 returns its result in the flags (`call 0x56b405; je special`, 6 sites): its two `ret`s keep them live.
+FLAG_RETURNING = frozenset({0x16b405})
+T.FLAG_RETURN_RETS = frozenset({0x16b416, 0x16b447})
+
 EXE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "game", "app", "TMNT_EN.EXE"))
 
 

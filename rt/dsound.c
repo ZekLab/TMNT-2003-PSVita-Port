@@ -23,8 +23,13 @@ typedef struct ds_buf {
     uint32_t channels, rate, bits, align;
     uint32_t freq;
     int32_t volume, pan;
-    int playing, looping;
-    double pos;
+    volatile int playing, looping;
+    double pos;                    /* mixer-owned read position in frames */
+    volatile uint32_t play_frame;  /* published copy of pos for the game; the game never takes the mixer lock (priority inversion) */
+    volatile int32_t seek;         /* SetCurrentPosition request in frames, applied by the mixer; -1 when none */
+    uint32_t *played;         /* per 256-byte chunk: content hash when it was last played (TMNT_PERF statistics) */
+    uint64_t last_lock_us;
+    uint32_t starved;         /* chunks of a stream played again with the same content: the game did not refill them in time */
 } ds_buf;
 
 static ds_buf *buffers[MAX_BUFFERS];
@@ -45,6 +50,7 @@ static uint32_t b_Release(CPU *c)
     for (int i = 0; i < MAX_BUFFERS; i++) if (buffers[i] == b) buffers[i] = NULL;
     pthread_mutex_unlock(&lock);
     if (b->mem) rt_free(b->mem);
+    free(b->played);
     com_forget(b->guest);
     free(b);
     return 0;
@@ -61,10 +67,8 @@ static uint32_t b_GetCaps(CPU *c)
 static uint32_t b_GetCurrentPosition(CPU *c)
 {
     ds_buf *b = THIS_HOST(ds_buf);
-    pthread_mutex_lock(&lock);
-    uint32_t play = b->bytes ? ((uint32_t)b->pos * b->align) % b->bytes : 0;
+    uint32_t play = b->bytes ? (b->play_frame * b->align) % b->bytes : 0;
     uint32_t lead = b->align * (b->freq ? b->freq : b->rate) / 50;
-    pthread_mutex_unlock(&lock);
     if (ARG(1)) st32(ARG(1), play);
     if (ARG(2)) st32(ARG(2), b->bytes ? (play + lead) % b->bytes : 0);
     return DS_OK;
@@ -97,13 +101,10 @@ static uint32_t b_Lock(CPU *c)
     uint32_t off = ARG(1), n = ARG(2), flags = ARG(7);
     if (flags & 2U) n = b->bytes;                       /* DSBLOCK_ENTIREBUFFER */
     if (!b->bytes) return 0x88780032U;
-    if (flags & 1U) {
-        pthread_mutex_lock(&lock);
-        off = ((uint32_t)b->pos * b->align + b->align * (b->freq ? b->freq : b->rate) / 50) % b->bytes;
-        pthread_mutex_unlock(&lock);
-    }
+    if (flags & 1U) off = (b->play_frame * b->align + b->align * (b->freq ? b->freq : b->rate) / 50) % b->bytes;
     off %= b->bytes;
     if (n > b->bytes) n = b->bytes;
+    b->last_lock_us = plat_ticks_us();
     uint32_t first = n < b->bytes - off ? n : b->bytes - off;
     st32(ARG(3), b->mem + off);
     st32(ARG(4), first);
@@ -114,18 +115,16 @@ static uint32_t b_Lock(CPU *c)
 static uint32_t b_Play(CPU *c)
 {
     ds_buf *b = THIS_HOST(ds_buf);
-    pthread_mutex_lock(&lock);
-    b->playing = 1;
     b->looping = (ARG(3) & 1U) != 0;
-    pthread_mutex_unlock(&lock);
+    b->playing = 1;
     return DS_OK;
 }
 static uint32_t b_SetCurrentPosition(CPU *c)
 {
     ds_buf *b = THIS_HOST(ds_buf);
-    pthread_mutex_lock(&lock);
-    b->pos = b->align ? (double)(ARG(1) / b->align) : 0;
-    pthread_mutex_unlock(&lock);
+    uint32_t frame = b->align ? ARG(1) / b->align : 0;
+    b->play_frame = frame;
+    b->seek = (int32_t)frame;
     return DS_OK;
 }
 static uint32_t b_SetFormat(CPU *c)
@@ -140,10 +139,7 @@ static uint32_t b_SetPan(CPU *c) { THIS_HOST(ds_buf)->pan = (int32_t)ARG(1); ret
 static uint32_t b_SetFrequency(CPU *c) { THIS_HOST(ds_buf)->freq = ARG(1); return DS_OK; }
 static uint32_t b_Stop(CPU *c)
 {
-    ds_buf *b = THIS_HOST(ds_buf);
-    pthread_mutex_lock(&lock);
-    b->playing = 0;
-    pthread_mutex_unlock(&lock);
+    THIS_HOST(ds_buf)->playing = 0;
     return DS_OK;
 }
 
@@ -164,6 +160,7 @@ static ds_buf *buffer_new(void)
 {
     ds_buf *b = calloc(1, sizeof *b);
     b->refs = 1;
+    b->seek = -1;
     b->channels = 2; b->rate = 22050; b->bits = 16; b->align = 4;
     b->guest = com_new(buffer_vtbl(), 16, b);
     pthread_mutex_lock(&lock);
@@ -183,6 +180,7 @@ static uint32_t ds_CreateSoundBuffer(CPU *c)
         if (!b->align) b->align = b->channels * b->bits / 8;
         b->bytes = bytes;
         b->mem = rt_alloc(bytes ? bytes : 4);
+        b->played = calloc(bytes / 256 + 1, sizeof *b->played);
         memset(G2H(b->mem), b->bits == 8 ? 0x80 : 0, bytes);
     }
     rt_log("[dsound] CreateSoundBuffer(%s, %u bytes, %u ch, %u Hz, %u bit, flags %x)\n", b->primary ? "primary" : "secondary",
@@ -199,7 +197,20 @@ static uint32_t ds_GetCaps(CPU *c)
 }
 static uint32_t ds_GetSpeakerConfig(CPU *c) { st32(ARG(1), 4); return DS_OK; }
 
-/* Mixes every playing secondary buffer into interleaved stereo S16 at out_rate. */
+/* One frame of a buffer as float stereo (mono is duplicated, 8-bit is unsigned). */
+static inline void frame_at(const ds_buf *b, const uint8_t *mem, uint32_t idx, float *l, float *r)
+{
+    const uint8_t *s = mem + (size_t)idx * b->align;
+    if (b->bits == 16) {
+        *l = (float)(int16_t)(s[0] | (s[1] << 8)) / 32768.0f;
+        *r = b->channels > 1 ? (float)(int16_t)(s[2] | (s[3] << 8)) / 32768.0f : *l;
+    } else {
+        *l = (float)(s[0] - 128) / 128.0f;
+        *r = b->channels > 1 ? (float)(s[1] - 128) / 128.0f : *l;
+    }
+}
+
+/* Mixes every playing secondary buffer into interleaved stereo S16 at out_rate (linear interpolation between frames). */
 void dsound_mix(int16_t *out, int frames)
 {
     static float *acc;
@@ -209,12 +220,17 @@ void dsound_mix(int16_t *out, int frames)
     pthread_mutex_lock(&lock);
     for (int i = 0; i < MAX_BUFFERS; i++) {
         ds_buf *b = buffers[i];
-        if (!b || b->primary || !b->playing || !b->bytes || !b->align) continue;
+        if (!b || b->primary || !b->bytes || !b->align) continue;
+        if (b->seek >= 0) { b->pos = b->seek; b->seek = -1; }
+        if (!b->playing) continue;
         uint32_t total = b->bytes / b->align, rate = b->freq ? b->freq : b->rate;
         double step = (double)rate / out_rate;
         float vol = b->volume <= -10000 ? 0.0f : powf(10.0f, (float)b->volume / 2000.0f);
         float pl = b->pan > 0 ? powf(10.0f, (float)-b->pan / 2000.0f) : 1.0f, pr = b->pan < 0 ? powf(10.0f, (float)b->pan / 2000.0f) : 1.0f;
         const uint8_t *mem = G2H(b->mem);
+        /* A looping buffer the game rewrote in the last second is a stream: playing a chunk twice without a rewrite = underrun. */
+        int streaming = b->played && b->looping && plat_ticks_us() - b->last_lock_us < 1000000U;
+        uint32_t chunk_prev = UINT32_MAX;
         for (int f = 0; f < frames; f++) {
             uint32_t idx = (uint32_t)b->pos;
             if (idx >= total) {
@@ -222,28 +238,55 @@ void dsound_mix(int16_t *out, int frames)
                 b->pos -= total;
                 idx = (uint32_t)b->pos;
             }
-            const uint8_t *s = mem + (size_t)idx * b->align;
-            float l, r;
-            if (b->bits == 16) {
-                l = (float)(int16_t)(s[0] | (s[1] << 8)) / 32768.0f;
-                r = b->channels > 1 ? (float)(int16_t)(s[2] | (s[3] << 8)) / 32768.0f : l;
-            } else {
-                l = (float)(s[0] - 128) / 128.0f;
-                r = b->channels > 1 ? (float)(s[1] - 128) / 128.0f : l;
+            if (streaming && (idx * b->align) / 256 != chunk_prev && (idx * b->align) % 256 < b->align) {
+                chunk_prev = (idx * b->align) / 256;
+                const uint32_t *w = (const uint32_t *)(mem + chunk_prev * 256);
+                uint32_t h = 2166136261U, any = 0, words = (b->bytes - chunk_prev * 256) < 256 ? (b->bytes - chunk_prev * 256) / 4 : 64;
+                for (uint32_t k = 0; k < words; k++) { h = (h ^ w[k]) * 16777619U; any |= w[k]; }
+                if (any && b->played[chunk_prev] == h) b->starved++;
+                b->played[chunk_prev] = h;
             }
+            uint32_t next = idx + 1 < total ? idx + 1 : (b->looping ? 0 : idx);
+            float l, r, l1, r1, t = (float)(b->pos - (double)idx);
+            frame_at(b, mem, idx, &l, &r);
+            frame_at(b, mem, next, &l1, &r1);
+            l += (l1 - l) * t;
+            r += (r1 - r) * t;
             acc[f * 2] += l * vol * pl;
             acc[f * 2 + 1] += r * vol * pr;
             b->pos += step;
         }
+        b->play_frame = (uint32_t)b->pos;
     }
     pthread_mutex_unlock(&lock);
     static long clipped, mixed;
+    static float peak;
     for (int i = 0; i < frames * 2; i++) {
-        float v = acc[i] * 32767.0f;
-        if (v > 32767.0f || v < -32768.0f) clipped++;
-        out[i] = (int16_t)(v > 32767.0f ? 32767 : v < -32768.0f ? -32768 : v);
+        float v = acc[i] * 32767.0f, a = fabsf(v);
+        if (a > 32767.0f) clipped++;
+        if (a > peak) peak = a;
+        /* Soft limiter above 80% of full scale: loud fights bend smoothly into the ceiling instead of being cut off. */
+        if (a > 26214.0f) v = copysignf(26214.0f + 6553.0f * tanhf((a - 26214.0f) / 6553.0f), v);
+        out[i] = (int16_t)v;
     }
     mixed += frames * 2;
+    /* TMNT_PERF: one [audio] line every 2 s with clipping, peak level and dry streams. */
+    static int stats = -1;
+    static long stats_next;
+    if (stats < 0) stats = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
+    if (stats && mixed >= stats_next) {
+        char dry[256] = "";
+        size_t len = 0;
+        pthread_mutex_lock(&lock);
+        for (int i = 0; i < MAX_BUFFERS && len < sizeof dry - 32; i++) {
+            ds_buf *b = buffers[i];
+            if (b && b->starved) { len += (size_t)snprintf(dry + len, sizeof dry - len, " #%d:%u", i, b->starved); b->starved = 0; }
+        }
+        pthread_mutex_unlock(&lock);
+        if (stats_next) rt_log("[audio] %ld clipped, peak %.0f, replayed stream chunks:%s\n", clipped, peak, len ? dry : " none");
+        clipped = 0; peak = 0;
+        stats_next = mixed + (long)out_rate * 2 * 2;
+    }
     /* TMNT_AUDIO_DUMP=file.wav records the final mix (44.1 kHz stereo S16) for offline analysis. */
     static FILE *dump;
     static int dump_init;
@@ -302,9 +345,10 @@ uint32_t dsound_create(uint32_t pp)
     if (!root.guest) {
         root.refs = 1;
         root.guest = com_new(COM_VTABLE(IDirectSound, impls), 16, &root);
-        /* Host audio output only with TMNT_AUDIO=1: the mixer is not finished and sounds bad. */
+        /* Host audio is on by default; TMNT_AUDIO=0 turns it off, and hidden test runs stay silent unless TMNT_AUDIO=1. */
         const char *audio_env = getenv("TMNT_AUDIO");
-        if (audio_env && *audio_env && *audio_env != '0') {
+        int audio = audio_env && *audio_env ? *audio_env != '0' : getenv("TMNT_HIDDEN") == NULL;
+        if (audio) {
             out_rate = plat_audio_start(dsound_mix);
         } else {
             pthread_t t;

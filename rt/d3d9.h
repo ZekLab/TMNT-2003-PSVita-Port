@@ -33,6 +33,8 @@ struct d3d_tex {
     uint32_t mem[MAX_LEVELS], pitch[MAX_LEVELS], bytes[MAX_LEVELS];
     d3d_surf *surf[MAX_LEVELS];
     GLuint gl;
+    GLuint gl_movie;   /* Vita: the ring texture holding the current movie frame (d3d9_gl), bound instead of gl */
+    int gl_movie_hw;   /* Vita: 1 + the hardware-decoded picture gl_movie shows (movie.h), 0 for none */
     uint32_t dirty;
     int uploaded;
     uint32_t sampler_key;
@@ -42,6 +44,10 @@ typedef struct d3d_buf {
     int kind;
     uint32_t guest, refs;
     uint32_t size, mem, usage, pool, fvf, fmt;
+    uint32_t version, lock_frame;            /* writes (non read-only locks) and the frame of the last one */
+    uint32_t gl_buf, gl_version, gl_key;     /* GL copy of a static buffer (d3d9_gl.c), its version and colour layout */
+    int gl_bad;                              /* drawn with two colour layouts: never cached */
+    uint8_t *gl_check;                       /* TMNT_VBO_CHECK=1: the bytes uploaded, to spot writes without a Lock */
 } d3d_buf;
 
 typedef struct d3d_decl_elem {
@@ -92,6 +98,9 @@ void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uin
 void gl_upload_texture(d3d_tex *t);
 void gl_set_render_target(d3d_device *d, d3d_surf *s);
 void gl_present(d3d_device *d);
+void gl_defer_delete_buffer(uint32_t buf);
+extern uint32_t d3d_frame_now;   /* frames presented so far (buffer write tracking) */
+extern d3d_buf *draw_vb_obj, *draw_ib_obj;   /* buffers behind the current draw; NULL for the UP draws */
 void gl_defer_delete(GLuint tex);
 uint32_t d3d_format_bpp(uint32_t fmt);
 int d3d_format_is_dxt(uint32_t fmt);

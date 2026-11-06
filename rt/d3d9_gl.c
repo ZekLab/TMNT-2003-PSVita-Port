@@ -5,8 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "d3d9.h"
+#include "movie.h"
+#include "par.h"
+#include "game_hooks.h"
+#include "overlay_font.h"
 
 /* GL state cache. The draw path re-specifies the whole fixed-function state for every D3D draw; vitaGL marks its pipeline dirty
  * (and re-selects a shader) on each such call even when nothing changed. Every simple state call in this file goes through these
@@ -84,7 +91,7 @@ static void sc_tex_envfv(GLenum target, GLenum pname, GLfloat *v)
 }
 /* Single-valued states: the last arguments, compared as a key of up to four words. */
 enum { SC_DEPTHMASK, SC_DEPTHFUNC, SC_ALPHAFUNC, SC_BLENDFUNC, SC_BLENDEQ, SC_CULLFACE, SC_FRONTFACE, SC_COLORMASK, SC_SHADE,
-       SC_POLYMODE, SC_FOGMODE, SC_FOGSTART, SC_FOGEND, SC_FOGDENSITY, SC_FOGCOLOR, SC_COUNT };
+       SC_POLYMODE, SC_FOGMODE, SC_FOGSTART, SC_FOGEND, SC_FOGDENSITY, SC_FOGCOLOR, SC_COLOR, SC_NORMAL, SC_COUNT };
 static uint32_t sc_key[SC_COUNT][4];
 static uint8_t sc_valid[SC_COUNT];
 static int sc_same(int k, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
@@ -114,6 +121,32 @@ static void sc_fogfv(GLenum p, const GLfloat *v)
 {
     if (p != GL_FOG_COLOR || !sc_same(SC_FOGCOLOR, sc_f(v[0]), sc_f(v[1]), sc_f(v[2]), sc_f(v[3]))) glFogfv(p, v);
 }
+/* glEnableClientState marks the fixed-function shaders dirty even when nothing changed, so vitaGL picks a shader again on every draw. */
+static signed char sc_client_on[7] = { -1, -1, -1, -1, -1, -1, -1 };
+static void sc_client_state(GLenum a, int on)
+{
+    int i = a == GL_VERTEX_ARRAY ? 0 : a == GL_NORMAL_ARRAY ? 1 : a == GL_COLOR_ARRAY ? 2
+          : 3 + (sc_client_unit == 0xFFFFFFFFU ? 0 : (int)(sc_client_unit - GL_TEXTURE0));
+    if (sc_client_on[i] == on) return;
+    sc_client_on[i] = (signed char)on;
+    if (on) glEnableClientState(a); else glDisableClientState(a);
+}
+static GLuint sc_array_buf, sc_element_buf;
+static void sc_bind_buffer(GLenum t, GLuint b)
+{
+    GLuint *cur = t == GL_ARRAY_BUFFER ? &sc_array_buf : &sc_element_buf;
+    if (*cur == b) return;
+    *cur = b;
+    glBindBuffer(t, b);
+}
+static void sc_color4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
+{
+    if (!sc_same(SC_COLOR, sc_f(r), sc_f(g), sc_f(b), sc_f(a))) glColor4f(r, g, b, a);
+}
+static void sc_normal3f(GLfloat x, GLfloat y, GLfloat z)
+{
+    if (!sc_same(SC_NORMAL, sc_f(x), sc_f(y), sc_f(z), 0)) glNormal3f(x, y, z);
+}
 #define glEnable(cap) sc_enable((cap), 1)
 #define glDisable(cap) sc_enable((cap), 0)
 #define glActiveTexture sc_active_texture
@@ -134,8 +167,14 @@ static void sc_fogfv(GLenum p, const GLfloat *v)
 #define glFogi sc_fogi
 #define glFogf sc_fogf
 #define glFogfv sc_fogfv
+#define glEnableClientState(a) sc_client_state((a), 1)
+#define glDisableClientState(a) sc_client_state((a), 0)
+#define glBindBuffer sc_bind_buffer
+#define glColor4f sc_color4f
+#define glNormal3f sc_normal3f
 
 static GLuint white_tex;
+static int tc_enabled[4];   /* texture coordinate arrays left enabled per unit (draw path and overlay) */
 static uint8_t *colors, *speculars;
 static float *positions;
 static size_t scratch_vertices;
@@ -144,6 +183,15 @@ static int shot_frame = -1, shot_every;
 static int cpu_texgen = -1;
 static int dump_frame = -2;
 static uint64_t last_present_us;
+
+/* Transform, viewport and texture-matrix memory: vitaGL re-uploads a matrix or viewport on every set, so the draw path sets them
+ * only when they change. Code that loads other matrices or viewports (pretransformed draws, the overlay, setup) clears it. */
+static int xf_valid;
+static float xf_last[3][16];
+static GLint vp_last[6] = { -1, -1, -1, -1, -1, -1 };
+static int texm_state[4];   /* 0 unknown, 1 identity, 2 the stage's matrix (texm_last) */
+static float texm_last[4][16];
+static void xf_forget(void) { xf_valid = 0; vp_last[2] = -1; memset(texm_state, 0, sizeof texm_state); }
 /* Frame time split, logged with the fps line: draw calls, texture uploads (part of the draws), the buffer swap; the rest is the game. */
 static uint64_t prof_draw_us, prof_upload_us, prof_swap_us, prof_upload_bytes, prof_frame_start;
 static uint32_t prof_draws, prof_uploads;
@@ -170,6 +218,7 @@ void gl_init_device(d3d_device *d)
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     update_mapping(d);
     glViewport(0, 0, map_fbw, map_fbh);
+    xf_forget();
     const char *s = getenv("TMNT_SHOT_FRAME");
     if (s) shot_frame = atoi(s);
     s = getenv("TMNT_SHOT_EVERY");
@@ -219,6 +268,27 @@ static void map_rect(d3d_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t
 
 static void expand_level(uint32_t fmt, const uint8_t *src, uint32_t pitch, uint32_t w, uint32_t h, uint8_t *dst)
 {
+#if defined(__ARM_NEON)
+    /* 32-bit ARGB, the common case (and the movie frames): swap red and blue 16 pixels at a time. */
+    if (fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8) {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *s = src + (size_t)y * pitch;
+            uint8_t *o = dst + (size_t)y * w * 4;
+            uint32_t x = 0;
+            for (; x + 16 <= w; x += 16) {
+                uint8x16x4_t v = vld4q_u8(s + x * 4), r;
+                r.val[0] = v.val[2]; r.val[1] = v.val[1]; r.val[2] = v.val[0];
+                r.val[3] = fmt == D3DFMT_X8R8G8B8 ? vdupq_n_u8(255) : v.val[3];
+                vst4q_u8(o + x * 4, r);
+            }
+            for (; x < w; x++) {
+                o[x * 4] = s[x * 4 + 2]; o[x * 4 + 1] = s[x * 4 + 1]; o[x * 4 + 2] = s[x * 4];
+                o[x * 4 + 3] = fmt == D3DFMT_X8R8G8B8 ? 255 : s[x * 4 + 3];
+            }
+        }
+        return;
+    }
+#endif
     for (uint32_t y = 0; y < h; y++) {
         const uint8_t *s = src + (size_t)y * pitch;
         uint8_t *o = dst + (size_t)y * w * 4;
@@ -254,13 +324,72 @@ static void expand_level(uint32_t fmt, const uint8_t *src, uint32_t pitch, uint3
 static void upload_texture(d3d_tex *t);
 void gl_upload_texture(d3d_tex *t)
 {
-    if (!t->dirty && t->gl) { glBindTexture(GL_TEXTURE_2D, t->gl); return; }
+    if (!t->dirty && t->gl) {
+        glBindTexture(GL_TEXTURE_2D, t->gl_movie ? t->gl_movie : t->gl);
+#ifdef __vita__
+        if (t->gl_movie_hw) movie_hw_bound_frame[t->gl_movie_hw - 1] = vglGetFrameNumber();
+#endif
+        return;
+    }
     uint64_t t0 = plat_ticks_us();
     upload_texture(t);
     prof_upload_us += plat_ticks_us() - t0;
     prof_uploads++;
     prof_upload_bytes += (uint64_t)t->w * t->h * 4;
 }
+
+#ifdef __vita__
+/* Movie frames on the Vita: glTexSubImage2D on a texture drawn in the last frames makes vitaGL copy the whole texture to new
+   memory first (2 MB per movie frame), so frames go round three textures of their own and are written straight into them. */
+#define MOVIE_RING 3
+static GLuint movie_ring[MOVIE_RING];
+static uint32_t movie_ring_w, movie_ring_h, movie_ring_next;
+
+static void upload_movie_frame(d3d_tex *t, const uint8_t *guest_pixels)
+{
+    if (movie_ring_w != t->w || movie_ring_h != t->h) {
+        for (int i = 0; i < MOVIE_RING; i++) {
+            if (movie_ring[i]) gl_defer_delete(movie_ring[i]);
+            glGenTextures(1, &movie_ring[i]);
+            glBindTexture(GL_TEXTURE_2D, movie_ring[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)t->w, (GLsizei)t->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, guest_pixels);
+        }
+        movie_ring_w = t->w;
+        movie_ring_h = t->h;
+    }
+    GLuint g = movie_ring[movie_ring_next];
+    movie_ring_next = (movie_ring_next + 1) % MOVIE_RING;
+    glBindTexture(GL_TEXTURE_2D, g);
+    uint8_t *dst = vglGetTexDataPointer(GL_TEXTURE_2D);
+    /* vitaGL rows are padded to 8 pixels. */
+    size_t stride = (size_t)((t->w + 7U) & ~7U) * 4, row = (size_t)movie_pin_w * 4;
+    for (int y = 0; dst && y < movie_pin_h; y++) memcpy(dst + y * stride, movie_pin + y * row, row);
+    if (t->gl_movie != g) { t->gl_movie = g; t->sampler_key = 0; }
+    t->gl_movie_hw = 0;
+}
+
+/* A picture of the hardware decoder (movie.h) as the movie texture: its video memory becomes a GL texture once (vitaGL then owns
+   it; these textures are never deleted), and binding it is all an "upload" takes. */
+static GLuint movie_hw_gl[MOVIE_HW_SLOTS];
+/* In the vitaGL we build (build/vitagl), not yet in the SDK's vitaGL.h. */
+void vglSetupTexture(GLenum target, void *data, SceGxmTextureFormat format, SceGxmTextureType type, GLsizei width, GLsizei height,
+                     GLsizei mip_count);
+
+static void bind_movie_hw(d3d_tex *t, int i)
+{
+    if (!movie_hw_gl[i]) {
+        glGenTextures(1, &movie_hw_gl[i]);
+        glBindTexture(GL_TEXTURE_2D, movie_hw_gl[i]);
+        vglSetupTexture(GL_TEXTURE_2D, movie_hw_mem[i], SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TEXTURE_LINEAR,
+                        (GLsizei)movie_hw_w, (GLsizei)movie_hw_h, 1);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, movie_hw_gl[i]);
+    }
+    movie_hw_bound_frame[i] = vglGetFrameNumber();
+    if (t->gl_movie != movie_hw_gl[i]) { t->gl_movie = movie_hw_gl[i]; t->sampler_key = 0; }
+    t->gl_movie_hw = i + 1;
+}
+#endif
 
 static void upload_texture(d3d_tex *t)
 {
@@ -285,10 +414,43 @@ static void upload_texture(d3d_tex *t)
                      : (t->fmt == D3DFMT_DXT2 || t->fmt == D3DFMT_DXT3) ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
             glCompressedTexImage2D(GL_TEXTURE_2D, (GLint)l, f, (GLsizei)w, (GLsizei)h, 0, (GLsizei)t->bytes[l], src);
         } else {
-            size_t need = (size_t)w * h * 4;
-            if (need > tmp_size) { tmp_size = need; tmp = realloc(tmp, tmp_size); }
-            expand_level(t->fmt, src, t->pitch[l], w, h, tmp);
-            glTexImage2D(GL_TEXTURE_2D, (GLint)l, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+            const uint8_t *pixels = src;
+            int is_movie = l == 0 && t->fmt == D3DFMT_A8R8G8B8 && movie_rgba_mem && t->mem[0] == movie_rgba_mem && t->pitch[0] == w * 4;
+#ifdef __vita__
+            /* Movie frame from the hardware decoder: already in video memory, laid out like this texture. */
+            if (is_movie && movie_pin_slot >= 0 && t->w == movie_hw_w && t->h == movie_hw_h) {
+                bind_movie_hw(t, movie_pin_slot);
+                continue;
+            }
+            static int hw_mismatch_logged;
+            if (is_movie && movie_pin_slot >= 0 && !hw_mismatch_logged) {
+                rt_log("[movie] movie texture %ux%u differs from the hardware pictures %ux%u: not shown\n", t->w, t->h, movie_hw_w,
+                       movie_hw_h);
+                hw_mismatch_logged = 1;
+            }
+#endif
+            /* Movie frame: only the picture's rectangle, straight from the decoder's slot (rt/movie.c). */
+            if (is_movie && movie_pin && (uint32_t)movie_pin_w <= w && (uint32_t)movie_pin_h <= h) {
+#ifdef __vita__
+                upload_movie_frame(t, src);
+#else
+                if (!t->uploaded) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, movie_pin_w, movie_pin_h, GL_RGBA, GL_UNSIGNED_BYTE, movie_pin);
+#endif
+                continue;
+            }
+            /* Any other upload of this texture uses its own GL texture again. */
+            if (l == 0 && t->gl_movie) { t->gl_movie = 0; t->gl_movie_hw = 0; t->sampler_key = 0; glBindTexture(GL_TEXTURE_2D, t->gl); }
+            /* A movie frame is already RGBA (rt/movie.c); everything else is converted. */
+            if (!is_movie) {
+                size_t need = (size_t)w * h * 4;
+                if (need > tmp_size) { tmp_size = need; tmp = realloc(tmp, tmp_size); }
+                expand_level(t->fmt, src, t->pitch[l], w, h, tmp);
+                pixels = tmp;
+            }
+            /* Re-uploads (movies, animated textures) reuse the texture storage instead of specifying it again. */
+            if (t->uploaded) glTexSubImage2D(GL_TEXTURE_2D, (GLint)l, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            else glTexImage2D(GL_TEXTURE_2D, (GLint)l, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
         }
     }
     t->dirty = 0;
@@ -484,10 +646,15 @@ static int apply_stages(d3d_device *d, int texcoords, int no_vertex_colour)
             cpu_texgen = getenv("TMNT_CPU_TEXGEN") && atoi(getenv("TMNT_CPU_TEXGEN"));
 #endif
         }
-        glMatrixMode(GL_TEXTURE);
-        /* CPU-generated coordinates already include the texture transform. */
-        if ((t[D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) && !(gen && cpu_texgen)) glLoadMatrixf(d->texm[s]); else glLoadIdentity();
-        glMatrixMode(GL_MODELVIEW);
+        /* CPU-generated coordinates already include the texture transform. Loaded only when it changes (vitaGL re-uploads a matrix
+         * on every load). */
+        int use_texm = (t[D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) && !(gen && cpu_texgen);
+        if (texm_state[s] != (use_texm ? 2 : 1) || (use_texm && memcmp(texm_last[s], d->texm[s], sizeof texm_last[s]))) {
+            glMatrixMode(GL_TEXTURE);
+            if (use_texm) { glLoadMatrixf(d->texm[s]); memcpy(texm_last[s], d->texm[s], sizeof texm_last[s]); } else glLoadIdentity();
+            glMatrixMode(GL_MODELVIEW);
+            texm_state[s] = use_texm ? 2 : 1;
+        }
 #ifndef __vita__
         if (gen && !cpu_texgen) {
             GLint mode = gen == D3DTSS_TCI_CAMERASPACENORMAL ? GL_NORMAL_MAP : gen == D3DTSS_TCI_SPHEREMAP ? GL_SPHERE_MAP
@@ -649,6 +816,24 @@ static void apply_lighting(d3d_device *d, int has_normal, int has_diffuse, int h
     }
     glEnable(GL_LIGHTING);
     if (rs[D3DRS_NORMALIZENORMALS]) glEnable(GL_NORMALIZE); else glDisable(GL_NORMALIZE);
+    /* Material, lights and their view matrix sent only when they change: vitaGL re-uploads its lighting uniforms on every set. */
+    static struct {
+        uint32_t valid, rsv[7], has_normal, has_diffuse;
+        float material[17], view[16];
+        d3d_light lights[8];
+    } last, now;
+    memset(&now, 0, sizeof now);
+    now.valid = 1;
+    now.rsv[0] = rs[D3DRS_AMBIENT]; now.rsv[1] = rs[D3DRS_LOCALVIEWER]; now.rsv[2] = rs[D3DRS_SPECULARENABLE];
+    now.rsv[3] = rs[D3DRS_COLORVERTEX]; now.rsv[4] = rs[D3DRS_DIFFUSEMATERIALSOURCE]; now.rsv[5] = rs[D3DRS_AMBIENTMATERIALSOURCE];
+    now.rsv[6] = rs[D3DRS_EMISSIVEMATERIALSOURCE];
+    now.has_normal = (uint32_t)has_normal; now.has_diffuse = (uint32_t)has_diffuse;
+    memcpy(now.material, d->material, sizeof now.material);
+    memcpy(now.view, d->view, sizeof now.view);
+    for (int i = 0; i < 8; i++)
+        if (d->lights[i].enabled) now.lights[i] = d->lights[i];
+    if (!memcmp(&now, &last, sizeof now)) return;
+    last = now;
     float amb[4];
     color4(rs[D3DRS_AMBIENT], amb);
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
@@ -802,6 +987,9 @@ static void bgra_to_rgba(const uint8_t *src, uint32_t stride, uint32_t n, uint8_
 
 static void load_projection(d3d_device *d)
 {
+    if (xf_valid == 1 && !memcmp(xf_last[0], d->proj, 64) && !memcmp(xf_last[1], d->view, 64) && !memcmp(xf_last[2], d->world, 64)) return;
+    memcpy(xf_last[0], d->proj, 64); memcpy(xf_last[1], d->view, 64); memcpy(xf_last[2], d->world, 64);
+    xf_valid = 1;
     glMatrixMode(GL_PROJECTION);
     static const float zfix[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, -1, 1 };
     glLoadMatrixf(zfix);
@@ -816,8 +1004,8 @@ static void set_viewport(d3d_device *d)
     uint32_t *vp = d->viewport;
     GLint r[4];
     map_rect(d, vp[0], vp[1], vp[2], vp[3], r);
-    glViewport(r[0], r[1], r[2], r[3]);
-    glDepthRange(u2f(vp[4]), u2f(vp[5]));
+    if (memcmp(r, vp_last, sizeof r)) { glViewport(r[0], r[1], r[2], r[3]); memcpy(vp_last, r, sizeof r); }
+    if (vp[4] != vp_last[4] || vp[5] != vp_last[5]) { glDepthRange(u2f(vp[4]), u2f(vp[5])); vp_last[4] = (GLint)vp[4]; vp_last[5] = (GLint)vp[5]; }
 }
 
 /* D3D texture coordinate generation done on the CPU for stage s: the camera-space normal (world * view, normalised when
@@ -825,6 +1013,69 @@ static void set_viewport(d3d_device *d)
  * uses it. Other modes, or a draw without normals, get (0, 0) so the unit still has coordinates (vitaGL crashed without them). */
 static float *texgen_buf[4];
 static size_t texgen_cap[4];
+typedef struct {
+    float wv[9], m[16];
+    int xf, norm;
+    const uint8_t *base;
+    uint32_t st;
+    float *out;
+} texgen_job;
+
+static void texgen_range(void *ctx, uint32_t from, uint32_t to, int worker)
+{
+    const texgen_job *j = ctx;
+    const float *wv = j->wv, *m = j->m;
+    int xf = j->xf, norm = j->norm;
+    uint32_t st = j->st, i = from;
+    const uint8_t *p = j->base + (size_t)from * st;
+    float *out = j->out;
+    (void)worker;
+#ifdef __ARM_NEON
+    /* Vita: four vertices at a time; reciprocal square root estimate with two Newton steps (~1e-7 relative). */
+    {
+        float32x4_t w0 = vdupq_n_f32(wv[0]), w1 = vdupq_n_f32(wv[1]), w2 = vdupq_n_f32(wv[2]), w3 = vdupq_n_f32(wv[3]);
+        float32x4_t w4 = vdupq_n_f32(wv[4]), w5 = vdupq_n_f32(wv[5]), w6 = vdupq_n_f32(wv[6]), w7 = vdupq_n_f32(wv[7]);
+        float32x4_t w8 = vdupq_n_f32(wv[8]);
+        float tm[6] = { xf ? m[0] : 1.0f, xf ? m[4] : 0.0f, xf ? m[8] : 0.0f, xf ? m[1] : 0.0f, xf ? m[5] : 1.0f, xf ? m[9] : 0.0f };
+        float32x4_t u0 = vdupq_n_f32(xf ? m[12] : 0.0f), v0 = vdupq_n_f32(xf ? m[13] : 0.0f);
+        for (; i + 4 <= to; i += 4, p += 4 * st) {
+            float nx[4], ny[4], nz[4];
+            for (int k = 0; k < 4; k++) { float n[3]; memcpy(n, p + k * st, 12); nx[k] = n[0]; ny[k] = n[1]; nz[k] = n[2]; }
+            float32x4_t x = vld1q_f32(nx), y = vld1q_f32(ny), z = vld1q_f32(nz);
+            float32x4_t c0 = vmlaq_f32(vmlaq_f32(vmulq_f32(x, w0), y, w3), z, w6);
+            float32x4_t c1 = vmlaq_f32(vmlaq_f32(vmulq_f32(x, w1), y, w4), z, w7);
+            float32x4_t c2 = vmlaq_f32(vmlaq_f32(vmulq_f32(x, w2), y, w5), z, w8);
+            if (norm) {
+                float32x4_t l = vmlaq_f32(vmlaq_f32(vmulq_f32(c0, c0), c1, c1), c2, c2);
+                uint32x4_t pos = vcgtq_f32(l, vdupq_n_f32(0.0f));
+                float32x4_t r = vrsqrteq_f32(l);
+                r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(l, r), r));
+                r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(l, r), r));
+                r = vbslq_f32(pos, r, vdupq_n_f32(1.0f));
+                c0 = vmulq_f32(c0, r); c1 = vmulq_f32(c1, r); c2 = vmulq_f32(c2, r);
+            }
+            float32x4x2_t uv;
+            uv.val[0] = vmlaq_n_f32(vmlaq_n_f32(vmlaq_n_f32(u0, c0, tm[0]), c1, tm[1]), c2, tm[2]);
+            uv.val[1] = vmlaq_n_f32(vmlaq_n_f32(vmlaq_n_f32(v0, c0, tm[3]), c1, tm[4]), c2, tm[5]);
+            vst2q_f32(out + i * 2, uv);
+        }
+    }
+#endif
+    for (; i < to; i++, p += st) {
+        float n[3];
+        memcpy(n, p, 12);
+        float c0 = n[0] * wv[0] + n[1] * wv[3] + n[2] * wv[6];
+        float c1 = n[0] * wv[1] + n[1] * wv[4] + n[2] * wv[7];
+        float c2 = n[0] * wv[2] + n[1] * wv[5] + n[2] * wv[8];
+        if (norm) {
+            float l = c0 * c0 + c1 * c1 + c2 * c2;
+            if (l > 0.0f) { l = 1.0f / sqrtf(l); c0 *= l; c1 *= l; c2 *= l; }
+        }
+        out[i * 2] = xf ? c0 * m[0] + c1 * m[4] + c2 * m[8] + m[12] : c0;
+        out[i * 2 + 1] = xf ? c0 * m[1] + c1 * m[5] + c2 * m[9] + m[13] : c1;
+    }
+}
+
 static const float *cpu_texgen_coords(d3d_device *d, int s, uint32_t gen, const vfmt *v, const uint8_t *const sbase[4],
                                       const uint32_t sstride[4], uint32_t total)
 {
@@ -850,25 +1101,140 @@ static const float *cpu_texgen_coords(d3d_device *d, int s, uint32_t gen, const 
     wv[6] = a[1] * a[5] - a[2] * a[4]; wv[7] = a[2] * a[3] - a[0] * a[5]; wv[8] = a[0] * a[4] - a[1] * a[3];
     float det = a[0] * wv[0] + a[1] * wv[1] + a[2] * wv[2];
     if (det != 0.0f) for (int i = 0; i < 9; i++) wv[i] /= det;
-    const float *m = d->texm[s];
-    int xf = (d->tss[s][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) != 0, norm = d->rs[D3DRS_NORMALIZENORMALS] != 0;
-    const uint8_t *p = sbase[v->normal_stream] + v->normal_off;
-    uint32_t st = sstride[v->normal_stream];
-    for (uint32_t i = 0; i < total; i++, p += st) {
-        float n[3];
-        memcpy(n, p, 12);
-        float c0 = n[0] * wv[0] + n[1] * wv[3] + n[2] * wv[6];
-        float c1 = n[0] * wv[1] + n[1] * wv[4] + n[2] * wv[7];
-        float c2 = n[0] * wv[2] + n[1] * wv[5] + n[2] * wv[8];
-        if (norm) {
-            float l = c0 * c0 + c1 * c1 + c2 * c2;
-            if (l > 0.0f) { l = 1.0f / sqrtf(l); c0 *= l; c1 *= l; c2 *= l; }
-        }
-        out[i * 2] = xf ? c0 * m[0] + c1 * m[4] + c2 * m[8] + m[12] : c0;
-        out[i * 2 + 1] = xf ? c0 * m[1] + c1 * m[5] + c2 * m[9] + m[13] : c1;
-    }
+    texgen_job j;
+    memcpy(j.wv, wv, sizeof j.wv);
+    memcpy(j.m, d->texm[s], sizeof j.m);
+    j.xf = (d->tss[s][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFF) != 0;
+    j.norm = d->rs[D3DRS_NORMALIZENORMALS] != 0;
+    j.base = sbase[v->normal_stream] + v->normal_off;
+    j.st = sstride[v->normal_stream];
+    j.out = out;
+    par_for(texgen_range, &j, total, 256);
     return out;
 }
+
+/* Vita names on the game's Game pad page (game_tmnt.c): while the game draws a "BUTTON n" label (n 1..8) its draws only record
+ * their screen box (framebuffer pixels, top left origin); the overlay writes the Vita button there. */
+int ovl_capture_slot = -1;
+static float ovl_box[9][4];
+static uint32_t ovl_box_frame[9];
+
+static void ovl_capture(d3d_device *d, const vfmt *v, const uint8_t *const sbase[4], const uint32_t sstride[4], uint32_t first,
+                        uint32_t total)
+{
+    float wv[16], m[16], *box = ovl_box[ovl_capture_slot];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            wv[r * 4 + k] = 0;
+            for (int i = 0; i < 4; i++) wv[r * 4 + k] += d->world[r * 4 + i] * d->view[i * 4 + k];
+        }
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            m[r * 4 + k] = 0;
+            for (int i = 0; i < 4; i++) m[r * 4 + k] += wv[r * 4 + i] * d->proj[i * 4 + k];
+        }
+    if (ovl_box_frame[ovl_capture_slot] != d->frame) {
+        box[0] = box[1] = 1e9f; box[2] = box[3] = -1e9f;
+        ovl_box_frame[ovl_capture_slot] = d->frame;
+    }
+    const uint32_t *vp = d->viewport;
+    for (uint32_t i = first; i < total; i++) {
+        float p[4] = { 0, 0, 0, 1 }, sx, sy;
+        memcpy(p, sbase[v->pos_stream] + (size_t)i * sstride[v->pos_stream] + v->pos_off, (size_t)(v->pos_rhw ? 16 : 4 * v->pos_comps));
+        if (v->pos_rhw) {
+            sx = p[0]; sy = p[1];
+        } else {
+            float cx = p[0] * m[0] + p[1] * m[4] + p[2] * m[8] + m[12], cy = p[0] * m[1] + p[1] * m[5] + p[2] * m[9] + m[13];
+            float cw = p[0] * m[3] + p[1] * m[7] + p[2] * m[11] + m[15];
+            if (cw == 0.0f) continue;
+            sx = (float)vp[0] + (cx / cw + 1.0f) * 0.5f * (float)vp[2];
+            sy = (float)vp[1] + (1.0f - cy / cw) * 0.5f * (float)vp[3];
+        }
+        float fx = (float)map_ox + sx * map_sx, fy = (float)map_oy + sy * map_sy;
+        if (fx < box[0]) box[0] = fx;
+        if (fy < box[1]) box[1] = fy;
+        if (fx > box[2]) box[2] = fx;
+        if (fy > box[3]) box[3] = fy;
+    }
+}
+
+/* Static vertex and index buffers drawn from GL buffers: uploaded once (colours already RGBA), so neither the colour conversion
+ * nor vitaGL's per-draw copy of the arrays runs for them. A buffer qualifies when it is not D3DUSAGE_DYNAMIC and has not been
+ * written for two frames; the draw must read it alone (one stream, no RHW positions, no CPU texture coordinates). A buffer written
+ * again goes into a new GL buffer, the old one deleted after the frame (refilling one the GPU may still read flickered breakable
+ * barrels and crates on the Vita); one drawn with another layout leaves the cache for good. Everything else keeps the client
+ * arrays. TMNT_VBO=0 turns it off. */
+uint32_t d3d_frame_now;
+d3d_buf *draw_vb_obj, *draw_ib_obj;
+static uint64_t dt_up_count, dt_up_bytes, dt_up_us;   /* GL buffer uploads, logged with the draw timing */
+static int vbo_on = -1;
+
+static int vbo_check = -1;
+
+static int buf_settled(const d3d_buf *b)
+{
+    return !(b->usage & D3DUSAGE_DYNAMIC) && !b->gl_bad && d3d_frame_now - b->lock_frame >= 2U;
+}
+
+static GLuint vbo_for(d3d_buf *b, int diffuse_off, uint32_t stride, uint32_t start)
+{
+    uint32_t key = diffuse_off >= 0 ? (stride << 16) | ((start + (uint32_t)diffuse_off) % stride + 1U) : stride << 16;
+    if (b->gl_bad) return 0;
+    if (b->gl_buf && b->gl_version == b->version) {
+        if (b->gl_key == key) return b->gl_buf;
+        if (vbo_check > 0) rt_log("[vbo] buffer %08x (%u bytes, fvf %x) drawn with another layout: not cached\n", b->mem, b->size, b->fvf);
+        b->gl_bad = 1;
+        return 0;
+    }
+    if (!buf_settled(b)) return 0;
+    if (b->gl_buf) { gl_defer_delete_buffer(b->gl_buf); b->gl_buf = 0; }   /* written again: a fresh buffer */
+    uint64_t t0 = plat_ticks_us();
+    uint8_t *tmp = malloc(b->size ? b->size : 4);
+    memcpy(tmp, G2H(b->mem), b->size);
+    if (vbo_check > 0) { free(b->gl_check); b->gl_check = malloc(b->size ? b->size : 4); memcpy(b->gl_check, tmp, b->size); }
+    if (diffuse_off >= 0)
+        for (uint32_t o = (start + (uint32_t)diffuse_off) % stride; o + 4 <= b->size; o += stride) {
+            uint8_t t = tmp[o]; tmp[o] = tmp[o + 2]; tmp[o + 2] = t;
+        }
+    if (!b->gl_buf) { GLuint g; glGenBuffers(1, &g); b->gl_buf = g; }
+    glBindBuffer(GL_ARRAY_BUFFER, b->gl_buf);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)b->size, tmp, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    free(tmp);
+    b->gl_version = b->version;
+    b->gl_key = key;
+    dt_up_count++; dt_up_bytes += b->size; dt_up_us += plat_ticks_us() - t0;
+    return b->gl_buf;
+}
+
+static GLuint ibo_for(d3d_buf *b)
+{
+    if (b->gl_buf && b->gl_version == b->version) return b->gl_buf;
+    if (!buf_settled(b)) return 0;
+    if (b->gl_buf) { gl_defer_delete_buffer(b->gl_buf); b->gl_buf = 0; }   /* written again: a fresh buffer */
+    uint64_t t0 = plat_ticks_us();
+    if (!b->gl_buf) { GLuint g; glGenBuffers(1, &g); b->gl_buf = g; }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->gl_buf);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)b->size, G2H(b->mem), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    b->gl_version = b->version;
+    dt_up_count++; dt_up_bytes += b->size; dt_up_us += plat_ticks_us() - t0;
+    return b->gl_buf;
+}
+
+/* CPU texture coordinates in any enabled stage (they change with the camera): such a draw keeps the client arrays. */
+static int draw_needs_texgen(d3d_device *d)
+{
+    for (int s = 0; s < 4 && d->tss[s][D3DTSS_COLOROP] != D3DTOP_DISABLE; s++)
+        if (d->tss[s][D3DTSS_TEXCOORDINDEX] & 0xFFFF0000U) return 1;
+    return 0;
+}
+
+/* TMNT_PERF=1: where a draw's host time goes (states and positions, colours, stages and texture coordinates, the vitaGL call)
+ * and how many vertices it converts; logged with the frame line. draw_min_index is the D3D MinIndex of an indexed draw. */
+static int draw_timing = -1;
+static uint64_t dt_us[4], dt_vertices, dt_prefix, dt_indices, dt_cached_vertices, dt_cached_draws;
+uint32_t draw_min_index;
 
 static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
                  const void *indices, int index32, uint32_t index_count);
@@ -956,16 +1322,54 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
         first_vertex = 0;
     }
     uint32_t total = first_vertex + num_vertices;
+    if (ovl_capture_slot > 0) { ovl_capture(d, &v, sbase, sstride, first_vertex, total); return; }
     ensure_scratch(total);
+    if (draw_timing < 0) draw_timing = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
+    uint64_t ta = draw_timing ? plat_ticks_us() : 0, tb = 0, tc = 0;
+    if (draw_timing) { dt_vertices += total; dt_prefix += draw_min_index; dt_indices += index_count; }
+    /* GL buffers for a static vertex buffer (and index buffer) read alone; pbase is then the offset into the GL buffer. */
+    if (vbo_on < 0) {
+        vbo_on = getenv("TMNT_VBO") ? atoi(getenv("TMNT_VBO")) : 1;
+        vbo_check = getenv("TMNT_VBO_CHECK") && atoi(getenv("TMNT_VBO_CHECK"));
+    }
+    GLuint vb_gl = 0, ib_gl = 0;
+    const uint8_t *pbase[4] = { sbase[0], sbase[1], sbase[2], sbase[3] };
+    if (vbo_on && draw_vb_obj && !v.pos_rhw && sbase[1] == sbase[0] && sbase[2] == sbase[0] && sbase[3] == sbase[0] &&
+        sstride[1] == sstride[0] && sstride[2] == sstride[0] && sstride[3] == sstride[0] && !draw_needs_texgen(d)) {
+        uint32_t start = (uint32_t)(sbase[0] - (const uint8_t *)G2H(draw_vb_obj->mem));
+        vb_gl = vbo_for(draw_vb_obj, v.diffuse_off >= 0 ? v.diffuse_off : -1, sstride[0], start);
+        if (vb_gl && vbo_check > 0 && draw_vb_obj->gl_check) {
+            uint32_t len = total * sstride[0];
+            if (start + len > draw_vb_obj->size) len = draw_vb_obj->size - start;
+            if (memcmp(draw_vb_obj->gl_check + start, G2H(draw_vb_obj->mem + start), len)) {
+                static int logged;
+                if (logged++ < 20)
+                    rt_log("[vbo] buffer %08x (%u bytes, usage %x, fvf %x, version %u) changed without a Lock: bytes %u..%u, stride %u\n",
+                           draw_vb_obj->mem, draw_vb_obj->size, draw_vb_obj->usage, draw_vb_obj->fvf, draw_vb_obj->version, start,
+                           start + len, sstride[0]);
+                memcpy(draw_vb_obj->gl_check + start, G2H(draw_vb_obj->mem + start), len);
+            }
+        }
+        if (vb_gl) {
+            for (int k = 0; k < 4; k++) pbase[k] = (const uint8_t *)(uintptr_t)start;
+            if (indices && draw_ib_obj) ib_gl = ibo_for(draw_ib_obj);
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vb_gl);
     set_viewport(d);
     apply_render_states(d, v.pos_rhw);
     if (v.pos_rhw) {
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, d->viewport[2], d->viewport[3], 0, 0, -1);
-        glTranslatef(0.5f - (float)d->viewport[0], 0.5f - (float)d->viewport[1], 0);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
+        static uint32_t rhw_vp[4];
+        if (xf_valid != 2 || memcmp(rhw_vp, d->viewport, sizeof rhw_vp)) {
+            xf_valid = 2;
+            memcpy(rhw_vp, d->viewport, sizeof rhw_vp);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(0, d->viewport[2], d->viewport[3], 0, 0, -1);
+            glTranslatef(0.5f - (float)d->viewport[0], 0.5f - (float)d->viewport[1], 0);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+        }
         const uint8_t *p = sbase[v.pos_stream] + v.pos_off;
         for (uint32_t i = 0; i < total; i++, p += sstride[v.pos_stream]) {
             float f[4];
@@ -977,29 +1381,36 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
         glDisable(GL_LIGHTING);
     } else {
         load_projection(d);
-        glVertexPointer(v.pos_comps, GL_FLOAT, (GLsizei)sstride[v.pos_stream], sbase[v.pos_stream] + v.pos_off);
+        glVertexPointer(v.pos_comps, GL_FLOAT, (GLsizei)sstride[v.pos_stream], pbase[v.pos_stream] + v.pos_off);
         apply_lighting(d, v.normal_off >= 0, v.diffuse_off >= 0, v.specular_off >= 0);
     }
     glEnableClientState(GL_VERTEX_ARRAY);
     if (v.normal_off >= 0 && !v.pos_rhw) {
         glEnableClientState(GL_NORMAL_ARRAY);
-        glNormalPointer(GL_FLOAT, (GLsizei)sstride[v.normal_stream], sbase[v.normal_stream] + v.normal_off);
+        glNormalPointer(GL_FLOAT, (GLsizei)sstride[v.normal_stream], pbase[v.normal_stream] + v.normal_off);
+        sc_valid[SC_NORMAL] = 0;
     } else {
         glDisableClientState(GL_NORMAL_ARRAY);
         glNormal3f(0, 0, 0);
     }
-    if (v.diffuse_off >= 0) {
+    if (draw_timing) tb = plat_ticks_us();
+    if (v.diffuse_off >= 0 && vb_gl) {
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(4, GL_UNSIGNED_BYTE, (GLsizei)sstride[v.diffuse_stream], pbase[v.diffuse_stream] + v.diffuse_off);
+        sc_valid[SC_COLOR] = 0;
+    } else if (v.diffuse_off >= 0) {
         bgra_to_rgba(sbase[v.diffuse_stream] + v.diffuse_off, sstride[v.diffuse_stream], total, colors);
         glEnableClientState(GL_COLOR_ARRAY);
         glColorPointer(4, GL_UNSIGNED_BYTE, 4, colors);
+        sc_valid[SC_COLOR] = 0;
     } else {
         glDisableClientState(GL_COLOR_ARRAY);
         glColor4f(1, 1, 1, 1);
     }
+    if (draw_timing) tc = plat_ticks_us();
     int units = apply_stages(d, v.tex_count, v.diffuse_off < 0 && (v.pos_rhw || !d->rs[D3DRS_LIGHTING]));
     /* Texture coordinate arrays: only units in use, plus those left enabled by an earlier draw. vitaGL has fewer client units than 4,
      * and glClientActiveTexture on a missing one switched off unit 0's coordinates (every textured draw then read one texel: white screen). */
-    static int tc_enabled[4];
     for (int s = 0; s < 4; s++) {
         uint32_t gen = s < units ? d->tss[s][D3DTSS_TEXCOORDINDEX] & 0xFFFF0000U : 0;
         const float *gen_uv = gen && cpu_texgen ? cpu_texgen_coords(d, s, gen, &v, sbase, sstride, total) : NULL;
@@ -1012,17 +1423,28 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
             glTexCoordPointer(2, GL_FLOAT, 8, gen_uv);
         } else if (want) {
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glTexCoordPointer(v.tex_size[set], GL_FLOAT, (GLsizei)sstride[v.tex_stream[set]], sbase[v.tex_stream[set]] + v.tex_off[set]);
+            glTexCoordPointer(v.tex_size[set], GL_FLOAT, (GLsizei)sstride[v.tex_stream[set]], pbase[v.tex_stream[set]] + v.tex_off[set]);
         } else {
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         }
         tc_enabled[s] = want;
     }
     glClientActiveTexture(GL_TEXTURE0);
-    if (indices)
+    uint64_t td = draw_timing ? plat_ticks_us() : 0;
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib_gl);
+    if (ib_gl) {
+        glDrawElements(gl_prim(prim), (GLsizei)index_count, index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
+                       (const void *)(uintptr_t)((const uint8_t *)indices - (const uint8_t *)G2H(draw_ib_obj->mem)));
+    } else if (indices) {
         glDrawElements(gl_prim(prim), (GLsizei)index_count, index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, indices);
-    else
+    } else {
         glDrawArrays(gl_prim(prim), (GLint)first_vertex, (GLsizei)num_vertices);
+    }
+    if (draw_timing && vb_gl) { dt_cached_vertices += total; dt_cached_draws++; }
+    if (draw_timing) {
+        uint64_t te = plat_ticks_us();
+        dt_us[0] += tb - ta; dt_us[1] += tc - tb; dt_us[2] += td - tc; dt_us[3] += te - td;
+    }
 }
 
 void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t count, uint32_t rects)
@@ -1061,6 +1483,20 @@ static GLuint *pending_deletes;
 static size_t pending_count, pending_cap;
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static GLuint *pending_buf_deletes;
+static size_t pending_buf_count, pending_buf_cap;
+
+void gl_defer_delete_buffer(uint32_t buf)
+{
+    pthread_mutex_lock(&pending_lock);
+    if (pending_buf_count == pending_buf_cap) {
+        pending_buf_cap = pending_buf_cap ? pending_buf_cap * 2 : 64;
+        pending_buf_deletes = realloc(pending_buf_deletes, pending_buf_cap * sizeof *pending_buf_deletes);
+    }
+    pending_buf_deletes[pending_buf_count++] = buf;
+    pthread_mutex_unlock(&pending_lock);
+}
+
 void gl_defer_delete(GLuint tex)
 {
     pthread_mutex_lock(&pending_lock);
@@ -1072,6 +1508,124 @@ void gl_defer_delete(GLuint tex)
     pthread_mutex_unlock(&pending_lock);
 }
 
+/* Vita button names drawn over the game's Controller settings > Game pad page in place of its "BUTTON n" labels (the game numbers
+ * joystick buttons from 1): the PlayStation symbols in their colours for 1-4, L, SELECT, R and L + R for 5-8. */
+static GLuint ovl_tex;
+
+static void ovl_quads(const float *pos, const float *uv, int n_quads)
+{
+    static float p[6 * 2 * 64], t[6 * 2 * 64];
+    for (int q = 0; q < n_quads; q++) {
+        static const int order[6] = { 0, 1, 2, 2, 1, 3 };
+        for (int k = 0; k < 6; k++) {
+            int v = order[k];
+            p[(q * 6 + k) * 2] = pos[q * 8 + v * 2]; p[(q * 6 + k) * 2 + 1] = pos[q * 8 + v * 2 + 1];
+            if (uv) { t[(q * 6 + k) * 2] = uv[q * 8 + v * 2]; t[(q * 6 + k) * 2 + 1] = uv[q * 8 + v * 2 + 1]; }
+        }
+    }
+    glVertexPointer(2, GL_FLOAT, 0, p);
+    if (uv) glTexCoordPointer(2, GL_FLOAT, 0, t);
+    glDrawArrays(GL_TRIANGLES, 0, n_quads * 6);
+}
+
+static void ovl_rounded_rect(float x, float y, float w, float h, float r)
+{
+    /* Centre and side bands as quads, corners as fans of thin triangles. */
+    float bands[3 * 8] = { x + r, y, x + w - r, y, x + r, y + h, x + w - r, y + h,
+                           x, y + r, x + r, y + r, x, y + h - r, x + r, y + h - r,
+                           x + w - r, y + r, x + w, y + r, x + w - r, y + h - r, x + w, y + h - r };
+    ovl_quads(bands, NULL, 3);
+    static float fan[4][3 * 2 * 8];
+    const float cx[4] = { x + r, x + w - r, x + r, x + w - r }, cy[4] = { y + r, y + r, y + h - r, y + h - r };
+    const float a0[4] = { 3.14159f, 4.71239f, 1.5708f, 0.0f };
+    for (int c = 0; c < 4; c++) {
+        for (int i = 0; i < 8; i++) {
+            float t0 = a0[c] + 1.5708f * i / 8.0f, t1 = a0[c] + 1.5708f * (i + 1) / 8.0f;
+            float *f = fan[c] + i * 6;
+            f[0] = cx[c]; f[1] = cy[c];
+            f[2] = cx[c] + r * cosf(t0); f[3] = cy[c] + r * sinf(t0);
+            f[4] = cx[c] + r * cosf(t1); f[5] = cy[c] + r * sinf(t1);
+        }
+        glVertexPointer(2, GL_FLOAT, 0, fan[c]);
+        glDrawArrays(GL_TRIANGLES, 0, 24);
+    }
+}
+
+/* Text: printable ASCII; '\1'..'\4' are the cross, circle, square and triangle symbols in their PlayStation colours. */
+static float ovl_text(float x, float y, float scale, const char *s, const float rgba[4])
+{
+    static const float sym[4][3] = { { 0.49f, 0.70f, 0.98f }, { 1.0f, 0.40f, 0.40f }, { 0.95f, 0.55f, 0.85f }, { 0.35f, 0.88f, 0.69f } };
+    float cw = OVL_CELL_W * scale, ch = OVL_CELL_H * scale;
+    for (; *s; s++) {
+        int g = (unsigned char)*s >= 1 && (unsigned char)*s <= 4 ? 94 + (unsigned char)*s : (unsigned char)*s - 32;
+        float adv = cw * (g >= 95 ? 1.1f : 0.6f);   /* Menlo glyphs are ~0.6 of the cell wide */
+        if (g < 0 || g > 98 || *s == ' ') { x += adv; continue; }
+        if (g >= 95) glColor4f(sym[g - 95][0], sym[g - 95][1], sym[g - 95][2], rgba[3]);
+        else glColor4f(rgba[0], rgba[1], rgba[2], rgba[3]);
+        float u0 = (float)(g % OVL_COLS * OVL_CELL_W) / 256.0f, v0 = (float)(g / OVL_COLS * OVL_CELL_H) / 256.0f;
+        float u1 = u0 + (float)OVL_CELL_W / 256.0f, v1 = v0 + (float)OVL_CELL_H / 256.0f;
+        float pos[8] = { x, y, x + cw, y, x, y + ch, x + cw, y + ch }, uv[8] = { u0, v0, u1, v0, u0, v1, u1, v1 };
+        ovl_quads(pos, uv, 1);
+        x += adv;
+    }
+    return x;
+}
+
+static void draw_vita_overlay(uint32_t frame)
+{
+    if (!ovl_tex) {
+        static uint8_t rgba[256 * 256 * 4];
+        for (int y = 0; y < OVL_FONT_H; y++)
+            for (int x = 0; x < OVL_FONT_W; x++) {
+                uint8_t *q = rgba + ((size_t)y * 256 + (size_t)x) * 4;
+                q[0] = q[1] = q[2] = 255; q[3] = ovl_font[y * OVL_FONT_W + x];
+            }
+        glGenTextures(1, &ovl_tex);
+        glBindTexture(GL_TEXTURE_2D, ovl_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    float W = (float)map_fbw, H = (float)map_fbh, scale = H / 544.0f;
+    glViewport(0, 0, map_fbw, map_fbh);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_ALPHA_TEST); glDisable(GL_FOG); glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST); glDisable(GL_POLYGON_OFFSET_FILL);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glBlendEquation(GL_FUNC_ADD);
+    xf_forget();
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, W, H, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    for (int u = 1; u < 4; u++) { glActiveTexture(GL_TEXTURE0 + (GLenum)u); glDisable(GL_TEXTURE_2D); }
+    glActiveTexture(GL_TEXTURE0);
+    glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY); glDisableClientState(GL_NORMAL_ARRAY);
+    for (int u = 1; u < 4; u++)
+        if (tc_enabled[u]) { glClientActiveTexture(GL_TEXTURE0 + (GLenum)u); glDisableClientState(GL_TEXTURE_COORD_ARRAY); tc_enabled[u] = 0; }
+    glClientActiveTexture(GL_TEXTURE0);
+
+    /* The game's "BUTTON n" labels (captured above) become the Vita buttons, at the label's place and height. */
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, ovl_tex);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    static const float white[4] = { 1, 1, 1, 1 };
+    static const char *names[9] = { "", "\1", "\2", "\3", "\4", "L", "SELECT", "R", "L + R" };
+    (void)scale;
+    for (int n = 1; n <= 8; n++) {
+        const float *box = ovl_box[n];
+        if (ovl_box_frame[n] != frame || box[2] <= box[0]) continue;
+        float h = box[3] - box[1], sc = h / (float)OVL_CELL_H * (n <= 4 ? 1.6f : 1.25f);   /* the symbols draw smaller than letters */
+        ovl_text(box[0], box[1] - h * (n <= 4 ? 0.35f : 0.15f), sc, names[n], white);
+    }
+
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    tc_enabled[0] = 0;
+    glColor4f(1, 1, 1, 1);
+}
+
 void gl_present(d3d_device *d)
 {
     pthread_mutex_lock(&pending_lock);
@@ -1079,7 +1633,14 @@ void gl_present(d3d_device *d)
         glDeleteTextures((GLsizei)pending_count, pending_deletes);
         pending_count = 0;
     }
+    if (pending_buf_count) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);   /* vitaGL keeps the bound one by address */
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDeleteBuffers((GLsizei)pending_buf_count, pending_buf_deletes);
+        pending_buf_count = 0;
+    }
     pthread_mutex_unlock(&pending_lock);
+    d3d_frame_now = d->frame;
     /* A file dump.req in the game directory asks the running game for a screenshot now and a draw dump of the next frame. */
     if (d->frame % 30 == 0 && access("dump.req", F_OK) == 0) {
         remove("dump.req");
@@ -1091,6 +1652,24 @@ void gl_present(d3d_device *d)
                    d->view[r * 4], d->view[r * 4 + 1], d->view[r * 4 + 2], d->view[r * 4 + 3], d->proj[r * 4], d->proj[r * 4 + 1],
                    d->proj[r * 4 + 2], d->proj[r * 4 + 3], d->world[r * 4], d->world[r * 4 + 1], d->world[r * 4 + 2], d->world[r * 4 + 3]);
     }
+    /* TMNT_MEMDUMP=f1,f2,...: the guest's global data (0x580000-0x900000) saved as mem_<frame>.bin at those frames. */
+    {
+        static int parsed;
+        static uint32_t dump_at[8], ndump;
+        if (!parsed) {
+            parsed = 1;
+            const char *e = getenv("TMNT_MEMDUMP");
+            while (e && *e && ndump < 8) { dump_at[ndump++] = (uint32_t)strtoul(e, (char **)&e, 10); if (*e == ',') e++; }
+        }
+        for (uint32_t i = 0; i < ndump; i++)
+            if (dump_at[i] == d->frame) {
+                char name[40];
+                snprintf(name, sizeof name, "mem_%05u.bin", d->frame);
+                FILE *f = fopen(name, "wb");
+                if (f) { fwrite(G2H(0x580000U), 1, 0x380000U, f); fclose(f); }
+            }
+    }
+    if (tmnt_pad_settings_active()) draw_vita_overlay(d->frame);
     if ((int)d->frame == shot_frame || (shot_every && d->frame % (uint32_t)shot_every == 0)) {
         char name[64];
         snprintf(name, sizeof name, "frame_%04u.png", d->frame);
@@ -1119,6 +1698,18 @@ void gl_present(d3d_device *d)
                total, dr, prof_draws / 300U, (double)prof_upload_us / frames / 1000.0, prof_uploads / 300U,
                (unsigned long long)(prof_upload_bytes / 300U / 1024U), sw, total - dr - sw);
         rt_prof_report(300);
+        if (draw_timing > 0) {
+            rt_log("[draw] per frame: states+positions %.2f ms, colours %.2f ms, stages+texcoords %.2f ms, vitaGL %.2f ms; %llu vertices "
+                   "(%llu before MinIndex, %llu from GL buffers in %llu draws), %llu indices\n", dt_us[0] / 300.0 / 1000.0,
+                   dt_us[1] / 300.0 / 1000.0, dt_us[2] / 300.0 / 1000.0, dt_us[3] / 300.0 / 1000.0, (unsigned long long)(dt_vertices / 300U),
+                   (unsigned long long)(dt_prefix / 300U), (unsigned long long)(dt_cached_vertices / 300U),
+                   (unsigned long long)(dt_cached_draws / 300U), (unsigned long long)(dt_indices / 300U));
+            rt_log("[draw] GL buffer uploads per frame: %.2f (%.1f KB, %.2f ms)\n", dt_up_count / 300.0, dt_up_bytes / 300.0 / 1024.0,
+                   dt_up_us / 300.0 / 1000.0);
+            dt_up_count = dt_up_bytes = dt_up_us = 0;
+            memset(dt_us, 0, sizeof dt_us);
+            dt_vertices = dt_prefix = dt_indices = dt_cached_vertices = dt_cached_draws = 0;
+        }
         prof_draw_us = prof_upload_us = prof_swap_us = prof_upload_bytes = 0;
         prof_draws = prof_uploads = 0;
         prof_frame_start = now;

@@ -774,6 +774,11 @@ def pair_is_safe(producer, between):
                 return False
     return True
 
+# `ret` instructions whose flags a caller reads after the call (set per binary, e.g. tmnt_image.py); every other `ret` ends
+# the flag state, as no compiler relies on flags across a call.
+FLAG_RETURN_RETS = frozenset()
+
+
 def flag_liveness(insns, members, succs, flags_dead_jmps=frozenset()):
     """Backward dataflow: which blocks end with flags still needed.
 
@@ -806,9 +811,9 @@ def flag_liveness(insns, members, succs, flags_dead_jmps=frozenset()):
                 last.operands[0].type != cx.X86_OP_IMM and
                 rvas[-1] not in flags_dead_jmps):
             external_flag_edge.add(b)
-        # TMNT: the MSVC 7.1 CRT assembly helpers return results in the flags (e.g. `call _load; je special`), so a
-        # return keeps every flag live.
-        if last.mnemonic in ("ret", "retf"):
+        # TMNT: a few MSVC 7.1 CRT assembly helpers return results in the flags (`call _load; je special`); only their returns
+        # keep the flags live (FLAG_RETURN_RETS).
+        if last.mnemonic in ("ret", "retf") and rvas[-1] in FLAG_RETURN_RETS:
             external_flag_edge.add(b)
     changed = True
     while changed:

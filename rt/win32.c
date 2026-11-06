@@ -12,6 +12,7 @@
 
 #include "guest.h"
 #include "runtime.h"
+#include "movie.h"
 #include "plat.h"
 #include "osdep.h"
 
@@ -80,6 +81,7 @@ typedef struct rt_handle {
     pthread_t thread;
     rt_thread_ctx *tctx;
     uint32_t start, param, suspended;
+    int movie;      /* TMNT_V0x.DAT: x + 1, so movie.c knows which movie Sofdec is reading */
 } rt_handle;
 
 #define MAX_HANDLES 1024
@@ -482,12 +484,19 @@ static uint32_t k_CreateFileA(CPU *c)
     if (!f) return ret_err(INVALID_HANDLE, ERROR_FILE_NOT_FOUND);
     uint32_t h = h_new(H_FILE);
     h_get(h, H_FILE)->f = f;
+    const char *base = strrchr(p, '/');
+    base = base ? base + 1 : p;
+    if (strncasecmp(base, "TMNT_V0", 7) == 0 && base[7] >= '0' && base[7] <= '2') {
+        h_get(h, H_FILE)->movie = base[7] - '0' + 1;
+        movie_note_open(base[7] - '0', p);
+    }
     return h;
 }
 static uint32_t k_ReadFile(CPU *c)
 {
     rt_handle *h = h_get(ARG(0), H_FILE);
     if (!h) return ret_err(0, ERROR_INVALID_HANDLE);
+    if (h->movie) movie_note_read(h->movie - 1, (uint64_t)ftello(h->f));
     size_t got = fread(G2H(ARG(1)), 1, ARG(2), h->f);
     if (ARG(3)) st32(ARG(3), (uint32_t)got);
     return 1;
@@ -960,6 +969,8 @@ static uint32_t d3d_Direct3DCreate9(CPU *c)
 {
     rt_log("[w32] Direct3DCreate9(%u)\n", ARG(0));
     if (getenv("TMNT_SELFTEST_POW")) rt_selftest_pow(c);
+    if (getenv("TMNT_SELFTEST_BLOCKS")) rt_selftest_blocks(c, getenv("TMNT_SELFTEST_BLOCKS"));
+    if (getenv("TMNT_SELFTEST_MC")) rt_selftest_mc(c, getenv("TMNT_SELFTEST_MC"));
     return d3d9_create();
 }
 uint32_t dsound_create(uint32_t pp);

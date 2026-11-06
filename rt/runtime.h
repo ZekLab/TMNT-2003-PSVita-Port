@@ -48,6 +48,8 @@ uint32_t rt_call_guest(CPU *__restrict c, uint32_t fn, int nargs, const uint32_t
 
 uint32_t rt_alloc(uint32_t n);
 void rt_free(uint32_t p);
+void rt_selftest_blocks(struct CPU *c, const char *spec);
+void rt_selftest_mc(struct CPU *c, const char *path);
 uint32_t rt_realloc(uint32_t p, uint32_t n);
 uint32_t rt_alloc_size(uint32_t p);
 uint32_t rt_heap_used(void);

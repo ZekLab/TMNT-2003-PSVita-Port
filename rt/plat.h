@@ -27,6 +27,8 @@ void plat_game_size(int *w, int *h);
 void plat_screenshot(const char *path);
 void plat_write_rgba_png(const char *path, const uint8_t *rgba, int w, int h);
 uint64_t plat_ticks_us(void);
+/* Current CPU/GPU clocks and battery percent (zeros where unknown, e.g. on the Mac). */
+void plat_power_info(int *arm, int *gpu, int *battery);
 /* Starts stereo S16 output pulling from `mix`; returns the output rate. */
 int plat_audio_start(void (*mix)(int16_t *out, int frames));
 

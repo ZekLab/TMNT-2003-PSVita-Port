@@ -253,6 +253,7 @@ static d3d_tex *texture_new(uint32_t w, uint32_t h, uint32_t levels, uint32_t us
 static uint32_t b_Lock(CPU *c)
 {
     d3d_buf *b = THIS_HOST(d3d_buf);
+    if (!(ARG(4) & D3DLOCK_READONLY)) { b->version++; b->lock_frame = d3d_frame_now; }
     st32(ARG(3), b->mem + ARG(1));
     return D3D_OK;
 }
@@ -279,6 +280,7 @@ static uint32_t b_Release(CPU *c)
         for (int s = 0; s < 4; s++) if (device && device->stream[s].vb == b) device->stream[s].vb = NULL;
         if (device && device->ib == b) device->ib = NULL;
         d3d_buf_bytes -= b->size;
+        if (b->gl_buf) gl_defer_delete_buffer(b->gl_buf);
         rt_free(b->mem);
         com_forget(b->guest);
         free(b);
@@ -590,7 +592,9 @@ static uint32_t d_DrawPrimitive(CPU *c)
 {
     d3d_device *d = THIS_HOST(d3d_device);
     if (!d->stream[0].vb) return D3D_OK;
+    draw_vb_obj = d->stream[0].vb;
     gl_draw(d, ARG(1), d->stream[0].vb->mem + d->stream[0].offset, d->stream[0].stride, ARG(2), prim_vertices(ARG(1), ARG(3)), NULL, 0, 0);
+    draw_vb_obj = NULL;
     return D3D_OK;
 }
 static uint32_t d_DrawIndexedPrimitive(CPU *c)
@@ -600,8 +604,14 @@ static uint32_t d_DrawIndexedPrimitive(CPU *c)
     int i32 = d->ib->fmt == D3DFMT_INDEX32;
     uint32_t n = prim_vertices(ARG(1), ARG(6));
     const void *idx = G2H(d->ib->mem + ARG(5) * (i32 ? 4U : 2U));
+    extern uint32_t draw_min_index;
+    draw_min_index = ARG(3);
+    draw_vb_obj = d->stream[0].vb;
+    draw_ib_obj = d->ib;
     gl_draw(d, ARG(1), d->stream[0].vb->mem + d->stream[0].offset + (uint32_t)((int32_t)ARG(2) * (int32_t)d->stream[0].stride),
             d->stream[0].stride, 0, ARG(3) + ARG(4), idx, i32, n);
+    draw_min_index = 0;
+    draw_vb_obj = draw_ib_obj = NULL;
     return D3D_OK;
 }
 static uint32_t d_DrawPrimitiveUP(CPU *c)

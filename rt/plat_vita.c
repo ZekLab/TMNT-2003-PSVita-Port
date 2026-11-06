@@ -5,12 +5,14 @@
 #include <string.h>
 
 #include <psp2/audioout.h>
+#include <psp2/power.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 
 #include "game_hooks.h"
 #include "osdep.h"
+#include "movie.h"
 #include "plat.h"
 #include "runtime.h"
 
@@ -39,6 +41,7 @@ int plat_video_init(int width, int height)
     int phycont = mem.size_phycont < 8 * 1024 * 1024 ? mem.size_phycont : 8 * 1024 * 1024;
     vglInitWithCustomSizes(0, SCREEN_W, SCREEN_H, 32 * 1024 * 1024, cdram > 0 ? cdram : 0, phycont, 0, SCE_GXM_MULTISAMPLE_NONE);
     vglWaitVblankStart(getenv("TMNT_VSYNC") ? GL_TRUE : GL_FALSE);
+    movie_hw_init();
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     rt_log("[plat] vitaGL %dx%d, game %dx%d\n", SCREEN_W, SCREEN_H, width, height);
     inited = 1;
@@ -80,9 +83,7 @@ int plat_pump(void)
     int start = (pad_now.buttons & SCE_CTRL_START) != 0, title = start && tmnt_title_active();
     dik[0x1C] = title ? 0x80 : 0;
     dik[0x01] = start && !title ? 0x80 : 0;
-    /* L + R together is the special attack, which the game only has on the keyboard (left Ctrl); plat_pad drops L and R then. */
-    const uint32_t lr = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
-    dik[0x1D] = (pad_now.buttons & lr) == lr ? 0x80 : 0;
+
     return 1;
 }
 
@@ -100,20 +101,22 @@ static int32_t stick(uint8_t v)
 }
 
 /* Joystick buttons as the game numbers them (ReadMe, from 1): 1 weak attack/decide, 2 strong attack/cancel, 3 jump,
- * 4 shuriken, 5 dash, 6 shuriken change, 7 air juggling. The user's layout: Cross, Circle, Square, Triangle, L, Select, R.
- * The D-pad is the joystick's hat (movement and menus), like the left stick. Start is Enter/Esc and L + R is left Ctrl (special
- * attack) on the keyboard (plat_pump). */
+ * 4 shuriken, 5 dash, 6 shuriken change, 7 air juggling, 8 special attack. Fixed Vita buttons: 1 Cross, 2 Circle, 3 Square,
+ * 4 Triangle, 5 L, 6 Select, 7 R, 8 L + R together; the game's own Controller settings > Game pad page reassigns actions.
+ * The D-pad is the joystick's hat (movement and menus), like the left stick. Start is Enter/Esc on the keyboard (plat_pump). */
 void plat_pad(uint32_t *buttons, int32_t axes[4], int *pov)
 {
     static const uint32_t map[7] = { SCE_CTRL_CROSS, SCE_CTRL_CIRCLE, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE,
                                      SCE_CTRL_LTRIGGER, SCE_CTRL_SELECT, SCE_CTRL_RTRIGGER };
     uint32_t b = pad_now.buttons;
-    if ((b & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)) == (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER))
-        b &= ~(uint32_t)(SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER);   /* L + R is the special attack (plat_pump) */
+    const uint32_t lr = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
+    int chord = (b & lr) == lr;
+    if (chord) b &= ~lr;
     *buttons = 0;
     for (int i = 0; i < 7; i++)
         if (b & map[i])
             *buttons |= 1U << i;
+    if (chord) *buttons |= 1U << 7;   /* L + R is button 8, the game's default special attack */
     axes[0] = stick(pad_now.lx);
     axes[1] = stick(pad_now.ly);
     axes[2] = stick(pad_now.rx);
@@ -223,6 +226,13 @@ void plat_screenshot(const char *path)
     free(rows);
 }
 
+void plat_power_info(int *arm, int *gpu, int *battery)
+{
+    *arm = scePowerGetArmClockFrequency();
+    *gpu = scePowerGetGpuClockFrequency();
+    *battery = scePowerGetBatteryLifePercent();
+}
+
 /* Audio: a thread pulls 1024-frame blocks from the mixer into a blocking SceAudioOut port. */
 #define AUDIO_RATE 48000
 #define AUDIO_GRAIN 1024
@@ -238,9 +248,24 @@ static void *audio_thread(void *arg)
         return NULL;
     }
     static int16_t buf[2][AUDIO_GRAIN * 2];
+    /* TMNT_PERF: mix time and the longest gap between two blocks handed to SceAudioOut (a block lasts 21.3 ms). */
+    int stats = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
+    uint64_t last = sceKernelGetProcessTimeWide(), report = last + 2000000, mix_sum = 0, mix_max = 0, gap_max = 0;
+    int blocks = 0;
     for (int i = 0;; i ^= 1) {
+        uint64_t t0 = sceKernelGetProcessTimeWide();
         audio_mix(buf[i], AUDIO_GRAIN);
+        uint64_t t1 = sceKernelGetProcessTimeWide();
         sceAudioOutOutput(port, buf[i]);
+        if (!stats) continue;
+        mix_sum += t1 - t0; if (t1 - t0 > mix_max) mix_max = t1 - t0;
+        if (t0 - last > gap_max) gap_max = t0 - last;
+        last = t0; blocks++;
+        if (t0 >= report) {
+            rt_log("[audio] %d blocks, mix avg %.2f ms max %.2f ms, longest gap %.1f ms\n", blocks,
+                   (double)mix_sum / blocks / 1000.0, (double)mix_max / 1000.0, (double)gap_max / 1000.0);
+            report = t0 + 2000000; mix_sum = mix_max = gap_max = 0; blocks = 0;
+        }
     }
     return NULL;
 }
