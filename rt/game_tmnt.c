@@ -197,12 +197,16 @@ static int perf_checked;   /* the draw loops over views and checks once per view
  * windows under 8 ms give 60 FPS back (menus). TMNT_30FPS=0 turns it off, TMNT_30FPS=2 keeps it everywhere. */
 #define CAP_LEVEL 6U
 static int cap_on = -1, cap_heavy, cap_light;
+/* TMNT_FPS_LOCK (default 1): with the cadence on, the level is also kept from going above 6. Under load the game then runs a
+ * little slower for a moment instead of dropping to 25 or 20 drawn frames a second (levels 7 and 8). 0: the game's own choice. */
+static int fps_lock = 1;
 
 static int perf_begin(uint64_t *now)
 {
     if (perf_on < 0) {
         perf_on = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
         cap_on = getenv("TMNT_30FPS") ? atoi(getenv("TMNT_30FPS")) : 1;
+        if (getenv("TMNT_FPS_LOCK")) fps_lock = atoi(getenv("TMNT_FPS_LOCK"));
     }
     *now = rt_now_us();
     return 1;
@@ -215,6 +219,8 @@ static void cap_window(double logic_ms, double draw_ms)
     else if (cost < 8.0) { if (++cap_light >= 2) cap_heavy = 0; }
     else cap_light = 0;
 }
+
+int tmnt_phase(void) { return perf_phase; }
 
 void tmnt_hook_logic(CPU *c)
 {
@@ -231,6 +237,7 @@ void tmnt_hook_logic(CPU *c)
                t / s, perf_drawn, perf_drawn / s, perf_logic / t / 1000.0, perf_draw / d / 1000.0, perf_wait / t / 1000.0,
                perf_other / t / 1000.0, ld32(SKIP_LEVEL), ldd(SPEED_PERCENT), hle_us[0] / t / 1000.0, hle_us[1] / t / 1000.0,
                hle_us[2] / t / 1000.0);
+        if (perf_on) plat_cpu_report();
         if (perf_on) {
             int arm, gpu, battery;
             plat_power_info(&arm, &gpu, &battery);
@@ -275,7 +282,10 @@ void tmnt_hook_skip_check(CPU *c)
     if (!perf_begin(&now)) return;
     if (perf_phase == 2) {
         if (perf_checked++) return;
-        if ((cap_on == 2 || (cap_on && cap_heavy)) && ld32(SKIP_LEVEL) < CAP_LEVEL) st32(SKIP_LEVEL, CAP_LEVEL);
+        if (cap_on == 2 || (cap_on && cap_heavy)) {
+            uint32_t level = ld32(SKIP_LEVEL);
+            if (level < CAP_LEVEL || (fps_lock && level > CAP_LEVEL)) st32(SKIP_LEVEL, CAP_LEVEL);
+        }
         if (!ld32(SKIP_TABLE + 4U * (ld32(SKIP_LEVEL) * 12U + ld32(SKIP_INDEX)))) perf_drawn++;
     } else if (perf_phase == 3) {
         perf_wait += now - perf_t;
@@ -331,8 +341,8 @@ static skin_kind skin1 = { "skin1", sub_000f5880, 7, 0, 0, 2, 3, 4, 5, 6 };
 #ifdef __ARM_NEON
 /* NEON skinning: each bone matrix transposed once per call into columns, so a transformed vertex is three multiply-adds on
  * (x, y, z, -) vectors. Same results as the scalar code up to float rounding (the Mac check compares against the x87 body). */
-static float32x4_t skin_cols[2][256][4];   /* per thread of par_for */
-static uint8_t skin_have[2][256];
+static float32x4_t skin_cols[PAR_WORKERS][256][4];   /* per thread of par_for */
+static uint8_t skin_have[PAR_WORKERS][256];
 
 static const float32x4_t *skin_bone(int worker, const float *mats, uint32_t i)
 {
@@ -1072,6 +1082,109 @@ static int native_anim_curve(CPU *c)
     c->edx = edx;
     c->esp += 4U;
     return 1;
+}
+
+
+/* 0x4cc050: RenderWare D3D9 sends the render and texture stage states changed since the last draw. Each queued state whose new
+ * value differs from the one last sent goes to the device, and the queues empty. Through the device's COM table that is thousands
+ * of guest calls a frame in fights; here the device's own setters, when the device is ours. eax, ecx and edx end as the original
+ * leaves them (the count of the last queue run; the last entry's value and sent value, or the device, or the stage and value). */
+void sub_000cc050(CPU *__restrict c);
+int d3d9_is_device(uint32_t guest);
+void d3d9_set_render_state(uint32_t state, uint32_t value);
+void d3d9_set_texture_stage_state(uint32_t stage, uint32_t type, uint32_t value);
+size_t d3d9_states_size(void);
+void d3d9_states_save(uint8_t *buf);
+void d3d9_states_load(const uint8_t *buf);
+
+#define RW_DEVICE 0x006a007cU
+#define RS_QUEUE_N 0x006a2e6cU
+#define RS_QUEUE 0x006a13c8U       /* queued render states */
+#define RS_NEW 0x006a1a58U         /* per state: new value, queued flag */
+#define RS_SENT 0x006a1710U        /* per state: value last sent */
+#define TSS_QUEUE_N 0x006a2e70U
+#define TSS_QUEUE 0x006a2508U      /* queued (stage, type) */
+#define TSS_NEW 0x006a0980U        /* per stage * 33 + type: new value, queued flag */
+#define TSS_SENT 0x006a20e8U
+#define FLUSH_LO TSS_NEW           /* the guest bytes the flush reads and writes */
+#define FLUSH_HI (TSS_QUEUE_N + 4U)
+
+static int native_flush_states(CPU *c)
+{
+    uint32_t dev = ld32(RW_DEVICE);
+    if (!d3d9_is_device(dev)) return 0;
+    uint32_t eax = ld32(RS_QUEUE_N), ecx = c->ecx, edx = c->edx;
+    if (eax) {
+        for (uint32_t i = 0; i < ld32(RS_QUEUE_N); i++) {
+            uint32_t s = ld32(RS_QUEUE + 4U * i), v = ld32(RS_NEW + 8U * s), sent = ld32(RS_SENT + 4U * s);
+            ecx = v;
+            edx = sent;
+            st32(RS_NEW + 8U * s + 4U, 0);
+            if (sent != v) {
+                edx = dev;
+                st32(RS_SENT + 4U * s, v);
+                d3d9_set_render_state(s, v);
+            }
+        }
+        eax = ld32(RS_QUEUE_N);
+        st32(RS_QUEUE_N, 0);
+    }
+    if (ld32(TSS_QUEUE_N)) {
+        for (uint32_t i = 0; i < ld32(TSS_QUEUE_N); i++) {
+            uint32_t stage = ld32(TSS_QUEUE + 8U * i), type = ld32(TSS_QUEUE + 8U * i + 4U), k = stage * 33U + type;
+            uint32_t v = ld32(TSS_NEW + 8U * k), sent = ld32(TSS_SENT + 4U * k);
+            ecx = stage;
+            edx = v;
+            st32(TSS_NEW + 8U * k + 4U, 0);
+            if (sent != v) {
+                st32(TSS_SENT + 4U * k, v);
+                d3d9_set_texture_stage_state(stage, type, v);
+            }
+        }
+        eax = ld32(TSS_QUEUE_N);
+        st32(TSS_QUEUE_N, 0);
+    }
+    c->eax = eax;
+    c->ecx = ecx;
+    c->edx = edx;
+    c->esp += 4U;
+    return 1;
+}
+
+static fast_stat stat_flush = { "rw d3d9 state flush" };
+
+/* TMNT_HLE_CHECK=1: native, then everything put back (guest tables, device states, registers) and the translated body; the
+ * registers, the tables and the device states must come out the same. */
+int tmnt_fast_rw_flush_states(CPU *c)
+{
+    if (hle_check_running) return 0;
+    if (!hle_checking()) return native_flush_states(c);
+    const uint32_t len = FLUSH_HI - FLUSH_LO;
+    size_t ds = d3d9_states_size();
+    uint8_t *mem0 = malloc(len), *mem1 = malloc(len), *dev0 = malloc(ds), *dev1 = malloc(ds), *dev2 = malloc(ds);
+    memcpy(mem0, G2H(FLUSH_LO), len);
+    d3d9_states_save(dev0);
+    CPU before = *c, after;
+    int done = native_flush_states(c);
+    if (done) {
+        after = *c;
+        memcpy(mem1, G2H(FLUSH_LO), len);
+        d3d9_states_save(dev1);
+        memcpy(G2H(FLUSH_LO), mem0, len);
+        d3d9_states_load(dev0);
+        *c = before;
+        hle_check_running = 1;
+        sub_000cc050(c);
+        hle_check_running = 0;
+        d3d9_states_save(dev2);
+        int regs = memcmp(c->r, after.r, sizeof c->r) != 0, mem = memcmp(mem1, G2H(FLUSH_LO), len) != 0, dev = memcmp(dev1, dev2, ds) != 0;
+        if ((regs || mem || dev) && stat_flush.bad++ < 5)
+            rt_log("[hle] %s mismatch: registers %d tables %d device %d; eax %08x/%08x ecx %08x/%08x edx %08x/%08x\n", stat_flush.name,
+                   regs, mem, dev, c->eax, after.eax, c->ecx, after.ecx, c->edx, after.edx);
+        if (++stat_flush.calls % 30000U == 0) rt_log("[hle] %s: %u checks, %u mismatches\n", stat_flush.name, stat_flush.calls, stat_flush.bad);
+    }
+    free(mem0); free(mem1); free(dev0); free(dev1); free(dev2);
+    return done;
 }
 
 static fast_stat stat_curve = { "anim curve" };

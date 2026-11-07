@@ -2,6 +2,7 @@
 #include "par.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -35,11 +36,12 @@ static int claim_and_run(int worker)
 
 static void *par_helper(void *arg)
 {
-    (void)arg;
+    int worker = (int)(intptr_t)arg;
     rt_thread_place_self(0, -1);   /* below the game's normal threads: it only spends idle time */
+    plat_thread_label(worker == 1 ? "par" : "par 2");
     uint64_t last = plat_ticks_us();
     for (;;) {
-        if (claim_and_run(1)) { last = plat_ticks_us(); continue; }
+        if (claim_and_run(worker)) { last = plat_ticks_us(); continue; }
         if (plat_ticks_us() - last > PAR_SPIN_US) usleep(200);
     }
     return NULL;
@@ -49,23 +51,29 @@ void par_init(void)
 {
     const char *e = getenv("TMNT_PAR");
     pthread_t t;
-    par_on = !(e && *e == '0');
-    if (par_on) {
-        if (pthread_create(&t, NULL, par_helper, NULL)) par_on = 0;
-        else pthread_detach(t);
+    /* TMNT_PAR=0 off, =1 one helper, default PAR_HELPERS (one per free core). */
+    int helpers = e ? atoi(e) : PAR_HELPERS;
+    if (helpers > PAR_HELPERS) helpers = PAR_HELPERS;
+    int started = 0;
+    for (int w = 1; w <= helpers; w++) {
+        if (pthread_create(&t, NULL, par_helper, (void *)(intptr_t)w)) break;
+        pthread_detach(t);
+        started++;
     }
-    rt_log("[par] helper thread %s\n", par_on ? "on" : "off");
+    par_on = started > 0;
+    rt_log("[par] %d helper thread%s\n", started, started == 1 ? "" : "s");
 }
 
 void par_for(par_fn *fn, void *ctx, uint32_t n, uint32_t min_n)
 {
-    if (!par_on || n < min_n || par_busy) { fn(ctx, 0, n, 0); return; }
-    par_busy = 1;
+    if (!par_on || n < min_n) { fn(ctx, 0, n, 0); return; }
+    /* One job at a time: the game thread and the render thread may both ask; the one that finds it taken works alone. */
+    if (__sync_lock_test_and_set(&par_busy, 1)) { fn(ctx, 0, n, 0); return; }
     uint32_t s = __atomic_load_n(&job_state, __ATOMIC_RELAXED);
     job_fn = fn; job_ctx = ctx; job_n = n;
     __atomic_store_n(&job_done, 0U, __ATOMIC_RELAXED);
     __atomic_store_n(&job_state, (((s >> 8) + 1U) << 8), __ATOMIC_RELEASE);
     while (claim_and_run(0)) { }
     while (__atomic_load_n(&job_done, __ATOMIC_ACQUIRE) < PAR_CHUNKS) { }
-    par_busy = 0;
+    __sync_lock_release(&par_busy);
 }

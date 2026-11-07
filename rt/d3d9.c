@@ -130,7 +130,7 @@ static uint32_t s_LockRect(CPU *c)
 static uint32_t s_UnlockRect(CPU *c)
 {
     d3d_surf *s = THIS_HOST(d3d_surf);
-    if (s->parent) s->parent->dirty |= 1U << s->level;
+    if (s->parent) __sync_fetch_and_or(&s->parent->dirty_pending, 1U << s->level);
     return D3D_OK;
 }
 static uint32_t s_GetContainer(CPU *c)
@@ -187,7 +187,7 @@ static uint32_t t_LockRect(CPU *c)
 static uint32_t t_UnlockRect(CPU *c)
 {
     d3d_tex *t = THIS_HOST(d3d_tex);
-    t->dirty |= 1U << ARG(1);
+    __sync_fetch_and_or(&t->dirty_pending, 1U << ARG(1));
     return D3D_OK;
 }
 static uint32_t t_GetType(CPU *c) { (void)c; return D3DRTYPE_TEXTURE; }
@@ -197,17 +197,15 @@ static uint32_t t_Release(CPU *c)
     if (!t) return 0;
     if (t->refs) t->refs--;
     if (t->refs == 0 && !getenv("TMNT_KEEP_TEXTURES")) {
-        /* The game may release on a loader thread: GL names are deleted on the render thread at the next Present. */
-        if (t->gl) gl_defer_delete(t->gl);
         d3d_tex_count--;
         for (uint32_t l = 0; l < t->levels; l++) {
             d3d_tex_bytes -= t->bytes[l];
-            rt_free(t->mem[l]);
-            if (t->surf[l]) { com_forget(t->surf[l]->guest); free(t->surf[l]); }
+            if (t->surf[l]) com_forget(t->surf[l]->guest);
         }
-        for (int s = 0; s < MAX_STAGES; s++) if (device && device->tex[s] == t) device->tex[s] = NULL;
+        for (int s = 0; s < MAX_STAGES; s++) if (device && device->tex[s] == t) { device->tex[s] = NULL; DEV_TOUCH(device, tex[s]); }
         com_forget(t->guest);
-        free(t);
+        /* The game may release on a loader thread: the GL texture and the memory go on the render side's terms. */
+        gl_texture_release(t);
         return 0;
     }
     return t->refs;
@@ -277,13 +275,11 @@ static uint32_t b_Release(CPU *c)
     if (!b) return 0;
     if (b->refs) b->refs--;
     if (b->refs == 0) {
-        for (int s = 0; s < 4; s++) if (device && device->stream[s].vb == b) device->stream[s].vb = NULL;
-        if (device && device->ib == b) device->ib = NULL;
+        for (int s = 0; s < 4; s++) if (device && device->stream[s].vb == b) { device->stream[s].vb = NULL; DEV_TOUCH(device, stream[s]); }
+        if (device && device->ib == b) { device->ib = NULL; DEV_TOUCH(device, ib); }
         d3d_buf_bytes -= b->size;
-        if (b->gl_buf) gl_defer_delete_buffer(b->gl_buf);
-        rt_free(b->mem);
         com_forget(b->guest);
-        free(b);
+        gl_buffer_release(b);
         return 0;
     }
     return b->refs;
@@ -476,7 +472,13 @@ static uint32_t d_GetRenderTarget(CPU *c)
     st32(ARG(2), s->guest);
     return D3D_OK;
 }
-static uint32_t d_SetDepthStencilSurface(CPU *c) { THIS_HOST(d3d_device)->ds = com_host(ARG(1)); return D3D_OK; }
+static uint32_t d_SetDepthStencilSurface(CPU *c)
+{
+    d3d_device *d = THIS_HOST(d3d_device);
+    d->ds = com_host(ARG(1));
+    DEV_TOUCH(d, ds);
+    return D3D_OK;
+}
 static uint32_t d_GetDepthStencilSurface(CPU *c)
 {
     d3d_device *d = THIS_HOST(d3d_device);
@@ -485,8 +487,8 @@ static uint32_t d_GetDepthStencilSurface(CPU *c)
     st32(ARG(1), s->guest);
     return D3D_OK;
 }
-static uint32_t d_BeginScene(CPU *c) { THIS_HOST(d3d_device)->in_scene = 1; return D3D_OK; }
-static uint32_t d_EndScene(CPU *c) { THIS_HOST(d3d_device)->in_scene = 0; return D3D_OK; }
+static uint32_t d_BeginScene(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); d->in_scene = 1; DEV_TOUCH(d, in_scene); return D3D_OK; }
+static uint32_t d_EndScene(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); d->in_scene = 0; DEV_TOUCH(d, in_scene); return D3D_OK; }
 static uint32_t d_Clear(CPU *c)
 {
     gl_clear(THIS_HOST(d3d_device), ARG(3), ARG(4), u2f(ARG(5)), ARG(6), ARG(1), ARG(2));
@@ -505,6 +507,7 @@ static uint32_t d_SetTransform(CPU *c)
     float *m = transform_slot(THIS_HOST(d3d_device), ARG(1));
     if (m) {
         memcpy(m, G2H(ARG(2)), 64);
+        gl_dev_touch(THIS_HOST(d3d_device), m, 64);
         static int nan_reports;
         for (int i = 0; i < 16; i++) {
             if (m[i] != m[i] || m[i] > 1e30f || m[i] < -1e30f) {
@@ -531,15 +534,17 @@ static uint32_t d_MultiplyTransform(CPU *c)
         for (int j = 0; j < 4; j++)
             r[i * 4 + j] = b[i * 4 + 0] * m[0 * 4 + j] + b[i * 4 + 1] * m[1 * 4 + j] + b[i * 4 + 2] * m[2 * 4 + j] + b[i * 4 + 3] * m[3 * 4 + j];
     memcpy(m, r, 64);
+    gl_dev_touch(THIS_HOST(d3d_device), m, 64);
     return D3D_OK;
 }
-static uint32_t d_SetViewport(CPU *c) { memcpy(THIS_HOST(d3d_device)->viewport, G2H(ARG(1)), 24); return D3D_OK; }
+static uint32_t d_SetViewport(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); memcpy(d->viewport, G2H(ARG(1)), 24); DEV_TOUCH(d, viewport); return D3D_OK; }
 static uint32_t d_GetViewport(CPU *c) { memcpy(G2H(ARG(1)), THIS_HOST(d3d_device)->viewport, 24); return D3D_OK; }
-static uint32_t d_SetMaterial(CPU *c) { memcpy(THIS_HOST(d3d_device)->material, G2H(ARG(1)), 68); return D3D_OK; }
+static uint32_t d_SetMaterial(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); memcpy(d->material, G2H(ARG(1)), 68); DEV_TOUCH(d, material); return D3D_OK; }
 static uint32_t d_GetMaterial(CPU *c) { memcpy(G2H(ARG(1)), THIS_HOST(d3d_device)->material, 68); return D3D_OK; }
 static uint32_t d_SetLight(CPU *c)
 {
-    if (ARG(1) < 8) memcpy(THIS_HOST(d3d_device)->lights[ARG(1)].raw, G2H(ARG(2)), 104);
+    d3d_device *d = THIS_HOST(d3d_device);
+    if (ARG(1) < 8) { memcpy(d->lights[ARG(1)].raw, G2H(ARG(2)), 104); DEV_TOUCH(d, lights[ARG(1)]); }
     return D3D_OK;
 }
 static uint32_t d_GetLight(CPU *c)
@@ -549,11 +554,17 @@ static uint32_t d_GetLight(CPU *c)
 }
 static uint32_t d_LightEnable(CPU *c)
 {
-    if (ARG(1) < 8) THIS_HOST(d3d_device)->lights[ARG(1)].enabled = ARG(2) != 0;
+    d3d_device *d = THIS_HOST(d3d_device);
+    if (ARG(1) < 8) { d->lights[ARG(1)].enabled = ARG(2) != 0; DEV_TOUCH(d, lights[ARG(1)]); }
     return D3D_OK;
 }
 static uint32_t d_GetLightEnable(CPU *c) { st32(ARG(2), ARG(1) < 8 ? (uint32_t)THIS_HOST(d3d_device)->lights[ARG(1)].enabled : 0); return D3D_OK; }
-static uint32_t d_SetRenderState(CPU *c) { if (ARG(1) < 256) THIS_HOST(d3d_device)->rs[ARG(1)] = ARG(2); return D3D_OK; }
+static uint32_t d_SetRenderState(CPU *c)
+{
+    d3d_device *d = THIS_HOST(d3d_device);
+    if (ARG(1) < 256) { d->rs[ARG(1)] = ARG(2); DEV_TOUCH(d, rs[ARG(1)]); }
+    return D3D_OK;
+}
 static uint32_t d_GetRenderState(CPU *c) { st32(ARG(2), ARG(1) < 256 ? THIS_HOST(d3d_device)->rs[ARG(1)] : 0); return D3D_OK; }
 static uint32_t d_GetTexture(CPU *c)
 {
@@ -566,16 +577,28 @@ static uint32_t d_SetTexture(CPU *c)
 {
     if (ARG(1) < MAX_STAGES) {
         d3d_tex *t = com_host(ARG(2));
-        THIS_HOST(d3d_device)->tex[ARG(1)] = (t && t->kind == K_TEXTURE) ? t : NULL;
+        d3d_device *d = THIS_HOST(d3d_device);
+        d->tex[ARG(1)] = (t && t->kind == K_TEXTURE) ? t : NULL;
+        DEV_TOUCH(d, tex[ARG(1)]);
     }
     return D3D_OK;
 }
 static uint32_t d_GetTextureStageState(CPU *c) { st32(ARG(3), ARG(1) < MAX_STAGES && ARG(2) < 33 ? THIS_HOST(d3d_device)->tss[ARG(1)][ARG(2)] : 0); return D3D_OK; }
-static uint32_t d_SetTextureStageState(CPU *c) { if (ARG(1) < MAX_STAGES && ARG(2) < 33) THIS_HOST(d3d_device)->tss[ARG(1)][ARG(2)] = ARG(3); return D3D_OK; }
+static uint32_t d_SetTextureStageState(CPU *c)
+{
+    d3d_device *d = THIS_HOST(d3d_device);
+    if (ARG(1) < MAX_STAGES && ARG(2) < 33) { d->tss[ARG(1)][ARG(2)] = ARG(3); DEV_TOUCH(d, tss[ARG(1)][ARG(2)]); }
+    return D3D_OK;
+}
 static uint32_t d_GetSamplerState(CPU *c) { st32(ARG(3), ARG(1) < MAX_STAGES && ARG(2) < 14 ? THIS_HOST(d3d_device)->ss[ARG(1)][ARG(2)] : 0); return D3D_OK; }
-static uint32_t d_SetSamplerState(CPU *c) { if (ARG(1) < MAX_STAGES && ARG(2) < 14) THIS_HOST(d3d_device)->ss[ARG(1)][ARG(2)] = ARG(3); return D3D_OK; }
+static uint32_t d_SetSamplerState(CPU *c)
+{
+    d3d_device *d = THIS_HOST(d3d_device);
+    if (ARG(1) < MAX_STAGES && ARG(2) < 14) { d->ss[ARG(1)][ARG(2)] = ARG(3); DEV_TOUCH(d, ss[ARG(1)][ARG(2)]); }
+    return D3D_OK;
+}
 static uint32_t d_ValidateDevice(CPU *c) { if (ARG(1)) st32(ARG(1), 1); return D3D_OK; }
-static uint32_t d_SetScissorRect(CPU *c) { memcpy(THIS_HOST(d3d_device)->scissor, G2H(ARG(1)), 16); return D3D_OK; }
+static uint32_t d_SetScissorRect(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); memcpy(d->scissor, G2H(ARG(1)), 16); DEV_TOUCH(d, scissor); return D3D_OK; }
 static uint32_t d_GetScissorRect(CPU *c) { memcpy(G2H(ARG(1)), THIS_HOST(d3d_device)->scissor, 16); return D3D_OK; }
 
 static uint32_t prim_vertices(uint32_t type, uint32_t count)
@@ -619,6 +642,7 @@ static uint32_t d_DrawPrimitiveUP(CPU *c)
     d3d_device *d = THIS_HOST(d3d_device);
     gl_draw(d, ARG(1), ARG(3), ARG(4), 0, prim_vertices(ARG(1), ARG(2)), NULL, 0, 0);
     d->stream[0].vb = NULL;
+    DEV_TOUCH(d, stream[0]);
     return D3D_OK;
 }
 static uint32_t d_DrawIndexedPrimitiveUP(CPU *c)
@@ -628,6 +652,8 @@ static uint32_t d_DrawIndexedPrimitiveUP(CPU *c)
     gl_draw(d, ARG(1), ARG(7), ARG(8), 0, ARG(2) + ARG(3), G2H(ARG(5)), i32, prim_vertices(ARG(1), ARG(4)));
     d->stream[0].vb = NULL;
     d->ib = NULL;
+    DEV_TOUCH(d, stream[0]);
+    DEV_TOUCH(d, ib);
     return D3D_OK;
 }
 static uint32_t d_CreateVertexDeclaration(CPU *c)
@@ -650,10 +676,12 @@ static uint32_t d_SetVertexDeclaration(CPU *c)
     d3d_device *d = THIS_HOST(d3d_device);
     d->decl = com_host(ARG(1));
     if (d->decl) d->fvf = 0;
+    DEV_TOUCH(d, decl);
+    DEV_TOUCH(d, fvf);
     return D3D_OK;
 }
 static uint32_t d_GetVertexDeclaration(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); st32(ARG(1), d->decl ? d->decl->guest : 0); return D3D_OK; }
-static uint32_t d_SetFVF(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); d->fvf = ARG(1); d->decl = NULL; return D3D_OK; }
+static uint32_t d_SetFVF(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); d->fvf = ARG(1); d->decl = NULL; DEV_TOUCH(d, fvf); DEV_TOUCH(d, decl); return D3D_OK; }
 static uint32_t d_GetFVF(CPU *c) { st32(ARG(1), THIS_HOST(d3d_device)->fvf); return D3D_OK; }
 static uint32_t d_SetVertexShader(CPU *c)
 {
@@ -670,6 +698,7 @@ static uint32_t d_SetStreamSource(CPU *c)
         d->stream[ARG(1)].vb = com_host(ARG(2));
         d->stream[ARG(1)].offset = ARG(3);
         d->stream[ARG(1)].stride = ARG(4);
+        DEV_TOUCH(d, stream[ARG(1)]);
     }
     return D3D_OK;
 }
@@ -682,7 +711,7 @@ static uint32_t d_GetStreamSource(CPU *c)
     st32(ARG(4), d->stream[s].stride);
     return D3D_OK;
 }
-static uint32_t d_SetIndices(CPU *c) { THIS_HOST(d3d_device)->ib = com_host(ARG(1)); return D3D_OK; }
+static uint32_t d_SetIndices(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); d->ib = com_host(ARG(1)); DEV_TOUCH(d, ib); return D3D_OK; }
 static uint32_t d_GetIndices(CPU *c) { d3d_device *d = THIS_HOST(d3d_device); st32(ARG(1), d->ib ? d->ib->guest : 0); return D3D_OK; }
 static uint32_t d_Reset(CPU *c) { rt_log("[d3d] Reset\n"); (void)c; return D3D_OK; }
 static uint32_t d_GetCreationParameters(CPU *c)
@@ -696,7 +725,7 @@ static uint32_t d_UpdateTexture(CPU *c)
     if (!s || !t || s->kind != K_TEXTURE || t->kind != K_TEXTURE) return D3D_OK;
     for (uint32_t l = 0; l < s->levels && l < t->levels; l++)
         memcpy(G2H(t->mem[l]), G2H(s->mem[l]), s->bytes[l] < t->bytes[l] ? s->bytes[l] : t->bytes[l]);
-    t->dirty = (1U << t->levels) - 1;
+    __sync_fetch_and_or(&t->dirty_pending, (1U << t->levels) - 1);
     return D3D_OK;
 }
 static uint32_t d_StretchRect(CPU *c)
@@ -844,6 +873,38 @@ static uint32_t m_CreateDevice(CPU *c)
     gl_init_device(d);
     st32(ARG(6), d->guest);
     return D3D_OK;
+}
+
+/* Native callers of the device (game_tmnt.c): the same effects as the COM methods, without the guest call and thunk. */
+int d3d9_is_device(uint32_t guest)
+{
+    /* Our device, still with our method table (the replacement calls the methods the table would). */
+    return device && guest == device->guest && ld32(guest) == ld32(device->guest);
+}
+
+void d3d9_set_render_state(uint32_t state, uint32_t value)
+{
+    if (state < 256) { device->rs[state] = value; DEV_TOUCH(device, rs[state]); }
+}
+
+void d3d9_set_texture_stage_state(uint32_t stage, uint32_t type, uint32_t value)
+{
+    if (stage < MAX_STAGES && type < 33) { device->tss[stage][type] = value; DEV_TOUCH(device, tss[stage][type]); }
+}
+
+/* TMNT_HLE_CHECK: the render and texture stage states, saved and put back around the native and translated runs. */
+size_t d3d9_states_size(void) { return sizeof device->rs + sizeof device->tss; }
+void d3d9_states_save(uint8_t *buf)
+{
+    memcpy(buf, device->rs, sizeof device->rs);
+    memcpy(buf + sizeof device->rs, device->tss, sizeof device->tss);
+}
+void d3d9_states_load(const uint8_t *buf)
+{
+    memcpy(device->rs, buf, sizeof device->rs);
+    memcpy(device->tss, buf + sizeof device->rs, sizeof device->tss);
+    DEV_TOUCH(device, rs);
+    DEV_TOUCH(device, tss);
 }
 
 uint32_t d3d9_create(void)

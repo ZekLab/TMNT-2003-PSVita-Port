@@ -12,6 +12,7 @@
 #include "d3d9.h"
 #include "movie.h"
 #include "par.h"
+#include "osdep.h"
 #include "game_hooks.h"
 #include "overlay_font.h"
 
@@ -195,6 +196,10 @@ static void xf_forget(void) { xf_valid = 0; vp_last[2] = -1; memset(texm_state, 
 /* Frame time split, logged with the fps line: draw calls, texture uploads (part of the draws), the buffer swap; the rest is the game. */
 static uint64_t prof_draw_us, prof_upload_us, prof_swap_us, prof_upload_bytes, prof_frame_start;
 static uint32_t prof_draws, prof_uploads;
+/* Render thread (end of the file). */
+int gl_rq_mode;
+static uint64_t rq_wait_us, rq_bytes, rq_rec_us;   /* game-thread waits for the render thread, commands recorded and the game
+                                                    thread's time recording draws, for the [prof] line */
 static int map_fbw, map_fbh;
 static void update_mapping(d3d_device *d);
 
@@ -207,6 +212,7 @@ static void ensure_scratch(size_t n)
     positions = realloc(positions, scratch_vertices * 16);
 }
 
+static void rq_start(d3d_device *d);
 void gl_init_device(d3d_device *d)
 {
     glGenTextures(1, &white_tex);
@@ -223,6 +229,7 @@ void gl_init_device(d3d_device *d)
     if (s) shot_frame = atoi(s);
     s = getenv("TMNT_SHOT_EVERY");
     if (s) shot_every = atoi(s);
+    rq_start(d);
 }
 
 
@@ -321,9 +328,21 @@ static void expand_level(uint32_t fmt, const uint8_t *src, uint32_t pitch, uint3
     }
 }
 
+/* The movie picture the uploads use. movie.c and game_tmnt.c set the globals on the game thread when Sofdec converts a frame;
+ * the render side gets them with the draws that follow (mode 0 reads them at each draw). */
+typedef struct { const uint8_t *pin; int w, h, slot; uint32_t rgba_mem; } movie_state;
+static movie_state mv = { NULL, 0, 0, -1, 0 }, mv_sent = { NULL, 0, 0, -1, 0 };
+static movie_state movie_now(void)
+{
+    movie_state m = { movie_pin, movie_pin_w, movie_pin_h, movie_pin_slot, movie_rgba_mem };
+    return m;
+}
+
 static void upload_texture(d3d_tex *t);
 void gl_upload_texture(d3d_tex *t)
 {
+    /* Levels the game wrote (on any thread) since the last upload. */
+    if (t->dirty_pending) t->dirty |= __sync_fetch_and_and(&t->dirty_pending, 0U);
     if (!t->dirty && t->gl) {
         glBindTexture(GL_TEXTURE_2D, t->gl_movie ? t->gl_movie : t->gl);
 #ifdef __vita__
@@ -362,8 +381,8 @@ static void upload_movie_frame(d3d_tex *t, const uint8_t *guest_pixels)
     glBindTexture(GL_TEXTURE_2D, g);
     uint8_t *dst = vglGetTexDataPointer(GL_TEXTURE_2D);
     /* vitaGL rows are padded to 8 pixels. */
-    size_t stride = (size_t)((t->w + 7U) & ~7U) * 4, row = (size_t)movie_pin_w * 4;
-    for (int y = 0; dst && y < movie_pin_h; y++) memcpy(dst + y * stride, movie_pin + y * row, row);
+    size_t stride = (size_t)((t->w + 7U) & ~7U) * 4, row = (size_t)mv.w * 4;
+    for (int y = 0; dst && y < mv.h; y++) memcpy(dst + y * stride, mv.pin + y * row, row);
     if (t->gl_movie != g) { t->gl_movie = g; t->sampler_key = 0; }
     t->gl_movie_hw = 0;
 }
@@ -415,27 +434,27 @@ static void upload_texture(d3d_tex *t)
             glCompressedTexImage2D(GL_TEXTURE_2D, (GLint)l, f, (GLsizei)w, (GLsizei)h, 0, (GLsizei)t->bytes[l], src);
         } else {
             const uint8_t *pixels = src;
-            int is_movie = l == 0 && t->fmt == D3DFMT_A8R8G8B8 && movie_rgba_mem && t->mem[0] == movie_rgba_mem && t->pitch[0] == w * 4;
+            int is_movie = l == 0 && t->fmt == D3DFMT_A8R8G8B8 && mv.rgba_mem && t->mem[0] == mv.rgba_mem && t->pitch[0] == w * 4;
 #ifdef __vita__
             /* Movie frame from the hardware decoder: already in video memory, laid out like this texture. */
-            if (is_movie && movie_pin_slot >= 0 && t->w == movie_hw_w && t->h == movie_hw_h) {
-                bind_movie_hw(t, movie_pin_slot);
+            if (is_movie && mv.slot >= 0 && t->w == movie_hw_w && t->h == movie_hw_h) {
+                bind_movie_hw(t, mv.slot);
                 continue;
             }
             static int hw_mismatch_logged;
-            if (is_movie && movie_pin_slot >= 0 && !hw_mismatch_logged) {
+            if (is_movie && mv.slot >= 0 && !hw_mismatch_logged) {
                 rt_log("[movie] movie texture %ux%u differs from the hardware pictures %ux%u: not shown\n", t->w, t->h, movie_hw_w,
                        movie_hw_h);
                 hw_mismatch_logged = 1;
             }
 #endif
             /* Movie frame: only the picture's rectangle, straight from the decoder's slot (rt/movie.c). */
-            if (is_movie && movie_pin && (uint32_t)movie_pin_w <= w && (uint32_t)movie_pin_h <= h) {
+            if (is_movie && mv.pin && (uint32_t)mv.w <= w && (uint32_t)mv.h <= h) {
 #ifdef __vita__
                 upload_movie_frame(t, src);
 #else
                 if (!t->uploaded) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, movie_pin_w, movie_pin_h, GL_RGBA, GL_UNSIGNED_BYTE, movie_pin);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mv.w, mv.h, GL_RGBA, GL_UNSIGNED_BYTE, mv.pin);
 #endif
                 continue;
             }
@@ -1120,9 +1139,9 @@ static float ovl_box[9][4];
 static uint32_t ovl_box_frame[9];
 
 static void ovl_capture(d3d_device *d, const vfmt *v, const uint8_t *const sbase[4], const uint32_t sstride[4], uint32_t first,
-                        uint32_t total)
+                        uint32_t total, int slot)
 {
-    float wv[16], m[16], *box = ovl_box[ovl_capture_slot];
+    float wv[16], m[16], *box = ovl_box[slot];
     for (int r = 0; r < 4; r++)
         for (int k = 0; k < 4; k++) {
             wv[r * 4 + k] = 0;
@@ -1133,9 +1152,9 @@ static void ovl_capture(d3d_device *d, const vfmt *v, const uint8_t *const sbase
             m[r * 4 + k] = 0;
             for (int i = 0; i < 4; i++) m[r * 4 + k] += wv[r * 4 + i] * d->proj[i * 4 + k];
         }
-    if (ovl_box_frame[ovl_capture_slot] != d->frame) {
+    if (ovl_box_frame[slot] != d->frame) {
         box[0] = box[1] = 1e9f; box[2] = box[3] = -1e9f;
-        ovl_box_frame[ovl_capture_slot] = d->frame;
+        ovl_box_frame[slot] = d->frame;
     }
     const uint32_t *vp = d->viewport;
     for (uint32_t i = first; i < total; i++) {
@@ -1176,17 +1195,19 @@ static int buf_settled(const d3d_buf *b)
     return !(b->usage & D3DUSAGE_DYNAMIC) && !b->gl_bad && d3d_frame_now - b->lock_frame >= 2U;
 }
 
-static GLuint vbo_for(d3d_buf *b, int diffuse_off, uint32_t stride, uint32_t start)
+/* ver: the buffer version the draw needs. Pinned (render thread): the draw was recorded when the buffer was settled at version
+ * ver; a GL copy of it is used, or made if the buffer still holds that version, otherwise the draw keeps the client arrays. */
+static GLuint vbo_for(d3d_buf *b, int diffuse_off, uint32_t stride, uint32_t start, uint32_t ver, int pinned)
 {
     uint32_t key = diffuse_off >= 0 ? (stride << 16) | ((start + (uint32_t)diffuse_off) % stride + 1U) : stride << 16;
     if (b->gl_bad) return 0;
-    if (b->gl_buf && b->gl_version == b->version) {
+    if (b->gl_buf && b->gl_version == ver) {
         if (b->gl_key == key) return b->gl_buf;
         if (vbo_check > 0) rt_log("[vbo] buffer %08x (%u bytes, fvf %x) drawn with another layout: not cached\n", b->mem, b->size, b->fvf);
         b->gl_bad = 1;
         return 0;
     }
-    if (!buf_settled(b)) return 0;
+    if (pinned ? b->version != ver : !buf_settled(b)) return 0;
     if (b->gl_buf) { gl_defer_delete_buffer(b->gl_buf); b->gl_buf = 0; }   /* written again: a fresh buffer */
     uint64_t t0 = plat_ticks_us();
     uint8_t *tmp = malloc(b->size ? b->size : 4);
@@ -1201,23 +1222,23 @@ static GLuint vbo_for(d3d_buf *b, int diffuse_off, uint32_t stride, uint32_t sta
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)b->size, tmp, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     free(tmp);
-    b->gl_version = b->version;
+    b->gl_version = ver;
     b->gl_key = key;
     dt_up_count++; dt_up_bytes += b->size; dt_up_us += plat_ticks_us() - t0;
     return b->gl_buf;
 }
 
-static GLuint ibo_for(d3d_buf *b)
+static GLuint ibo_for(d3d_buf *b, uint32_t ver, int pinned)
 {
-    if (b->gl_buf && b->gl_version == b->version) return b->gl_buf;
-    if (!buf_settled(b)) return 0;
+    if (b->gl_buf && b->gl_version == ver) return b->gl_buf;
+    if (pinned ? b->version != ver : !buf_settled(b)) return 0;
     if (b->gl_buf) { gl_defer_delete_buffer(b->gl_buf); b->gl_buf = 0; }   /* written again: a fresh buffer */
     uint64_t t0 = plat_ticks_us();
     if (!b->gl_buf) { GLuint g; glGenBuffers(1, &g); b->gl_buf = g; }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->gl_buf);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)b->size, G2H(b->mem), GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    b->gl_version = b->version;
+    b->gl_version = ver;
     dt_up_count++; dt_up_bytes += b->size; dt_up_us += plat_ticks_us() - t0;
     return b->gl_buf;
 }
@@ -1236,19 +1257,25 @@ static int draw_timing = -1;
 static uint64_t dt_us[4], dt_vertices, dt_prefix, dt_indices, dt_cached_vertices, dt_cached_draws;
 uint32_t draw_min_index;
 
-static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
-                 const void *indices, int index32, uint32_t index_count);
-void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
-             const void *indices, int index32, uint32_t index_count)
-{
-    uint64_t t0 = plat_ticks_us();
-    draw(d, prim, vbase, stride0, first_vertex, num_vertices, indices, index32, index_count);
-    prof_draw_us += plat_ticks_us() - t0;
-    prof_draws++;
-}
+/* One draw, with everything the GL side needs: the vertex format, stream bases (guest memory, or the copies recorded with the
+ * draw), the buffers behind it for the GL buffer cache, and the game-thread globals of the moment (overlay slot, MinIndex). */
+typedef struct draw_pkt {
+    vfmt v;
+    uint32_t prim, first_vertex, num_vertices, total, index_count, min_index;
+    int index32, ovl_slot;
+    int vbo;                  /* -1 client arrays; 0 the cache decides at the draw (mode 0); 1 the cached copy of version vb_ver */
+    int ib_cached;            /* with vbo 1: indices from ib's cached copy of version ib_ver (else from the recorded copy) */
+    const uint8_t *sbase[4];
+    uint32_t sstride[4];
+    const void *indices;
+    d3d_buf *vb, *ib;
+    uint32_t vb_start, ib_off, vb_ver, ib_ver;
+    int32_t soff[4], ioff;    /* recorded copies of the streams and indices: offsets in the command arena, -1 for none */
+} draw_pkt;
 
-static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
-             const void *indices, int index32, uint32_t index_count)
+/* Game-thread half of a draw: format, stream bases and whether the GL buffer cache can serve it. 0 when nothing is drawn. */
+static int prepare_draw(d3d_device *d, draw_pkt *p, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex,
+                        uint32_t num_vertices, const void *indices, int index32, uint32_t index_count)
 {
     vfmt v;
     if (d->decl) parse_decl(d->decl, &v); else parse_fvf(d->fvf, &v);
@@ -1307,7 +1334,7 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
             free(px);
         }
     }
-    if (stride0 == 0) return;
+    if (stride0 == 0) return 0;
     const uint8_t *base0 = (const uint8_t *)G2H(vbase);
     const uint8_t *sbase[4] = { base0, base0, base0, base0 };
     uint32_t sstride[4] = { stride0, stride0, stride0, stride0 };
@@ -1322,37 +1349,73 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
         first_vertex = 0;
     }
     uint32_t total = first_vertex + num_vertices;
-    if (ovl_capture_slot > 0) { ovl_capture(d, &v, sbase, sstride, first_vertex, total); return; }
-    ensure_scratch(total);
-    if (draw_timing < 0) draw_timing = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
-    uint64_t ta = draw_timing ? plat_ticks_us() : 0, tb = 0, tc = 0;
-    if (draw_timing) { dt_vertices += total; dt_prefix += draw_min_index; dt_indices += index_count; }
-    /* GL buffers for a static vertex buffer (and index buffer) read alone; pbase is then the offset into the GL buffer. */
+    memset(p, 0, sizeof *p);
+    p->v = v;
+    p->prim = prim; p->first_vertex = first_vertex; p->num_vertices = num_vertices; p->total = total;
+    p->index_count = index_count; p->index32 = index32; p->indices = indices;
+    p->min_index = draw_min_index;
+    p->ovl_slot = ovl_capture_slot;
+    for (int k = 0; k < 4; k++) { p->sbase[k] = sbase[k]; p->sstride[k] = sstride[k]; p->soff[k] = -1; }
+    p->ioff = -1;
+    p->vb = draw_vb_obj;
+    p->ib = draw_ib_obj;
+    p->vbo = -1;
     if (vbo_on < 0) {
         vbo_on = getenv("TMNT_VBO") ? atoi(getenv("TMNT_VBO")) : 1;
         vbo_check = getenv("TMNT_VBO_CHECK") && atoi(getenv("TMNT_VBO_CHECK"));
     }
-    GLuint vb_gl = 0, ib_gl = 0;
-    const uint8_t *pbase[4] = { sbase[0], sbase[1], sbase[2], sbase[3] };
     if (vbo_on && draw_vb_obj && !v.pos_rhw && sbase[1] == sbase[0] && sbase[2] == sbase[0] && sbase[3] == sbase[0] &&
         sstride[1] == sstride[0] && sstride[2] == sstride[0] && sstride[3] == sstride[0] && !draw_needs_texgen(d)) {
-        uint32_t start = (uint32_t)(sbase[0] - (const uint8_t *)G2H(draw_vb_obj->mem));
-        vb_gl = vbo_for(draw_vb_obj, v.diffuse_off >= 0 ? v.diffuse_off : -1, sstride[0], start);
-        if (vb_gl && vbo_check > 0 && draw_vb_obj->gl_check) {
+        p->vb_start = (uint32_t)(sbase[0] - (const uint8_t *)G2H(draw_vb_obj->mem));
+        p->vb_ver = draw_vb_obj->version;
+        if (indices && draw_ib_obj) {
+            p->ib_off = (uint32_t)((const uint8_t *)indices - (const uint8_t *)G2H(draw_ib_obj->mem));
+            p->ib_ver = draw_ib_obj->version;
+        }
+        /* Recorded draws decide now, while the buffer is known to hold what the game drew: a settled buffer is served from its
+         * GL copy, anything else is copied into the command arena. */
+        if (!gl_rq_mode) p->vbo = 0;
+        else if (buf_settled(draw_vb_obj)) { p->vbo = 1; p->ib_cached = indices && draw_ib_obj && buf_settled(draw_ib_obj); }
+    }
+    return 1;
+}
+
+/* GL half of a draw (the render thread in mode 1). */
+static void exec_draw(d3d_device *d, const draw_pkt *p)
+{
+    vfmt v = p->v;
+    const uint8_t *sbase[4] = { p->sbase[0], p->sbase[1], p->sbase[2], p->sbase[3] };
+    uint32_t sstride[4] = { p->sstride[0], p->sstride[1], p->sstride[2], p->sstride[3] };
+    uint32_t prim = p->prim, first_vertex = p->first_vertex, num_vertices = p->num_vertices, total = p->total;
+    uint32_t index_count = p->index_count;
+    const void *indices = p->indices;
+    int index32 = p->index32;
+    if (p->ovl_slot > 0) { ovl_capture(d, &v, sbase, sstride, first_vertex, total, p->ovl_slot); return; }
+    ensure_scratch(total);
+    if (draw_timing < 0) draw_timing = getenv("TMNT_PERF") && atoi(getenv("TMNT_PERF"));
+    uint64_t ta = draw_timing ? plat_ticks_us() : 0, tb = 0, tc = 0;
+    if (draw_timing) { dt_vertices += total; dt_prefix += p->min_index; dt_indices += index_count; }
+    /* GL buffers for a static vertex buffer (and index buffer) read alone; pbase is then the offset into the GL buffer. */
+    GLuint vb_gl = 0, ib_gl = 0;
+    const uint8_t *pbase[4] = { sbase[0], sbase[1], sbase[2], sbase[3] };
+    if (p->vbo >= 0) {
+        int pinned = p->vbo == 1;
+        vb_gl = vbo_for(p->vb, v.diffuse_off >= 0 ? v.diffuse_off : -1, sstride[0], p->vb_start, pinned ? p->vb_ver : p->vb->version, pinned);
+        if (vb_gl && vbo_check > 0 && p->vb->gl_check) {
             uint32_t len = total * sstride[0];
-            if (start + len > draw_vb_obj->size) len = draw_vb_obj->size - start;
-            if (memcmp(draw_vb_obj->gl_check + start, G2H(draw_vb_obj->mem + start), len)) {
+            if (p->vb_start + len > p->vb->size) len = p->vb->size - p->vb_start;
+            if (memcmp(p->vb->gl_check + p->vb_start, G2H(p->vb->mem + p->vb_start), len)) {
                 static int logged;
                 if (logged++ < 20)
                     rt_log("[vbo] buffer %08x (%u bytes, usage %x, fvf %x, version %u) changed without a Lock: bytes %u..%u, stride %u\n",
-                           draw_vb_obj->mem, draw_vb_obj->size, draw_vb_obj->usage, draw_vb_obj->fvf, draw_vb_obj->version, start,
-                           start + len, sstride[0]);
-                memcpy(draw_vb_obj->gl_check + start, G2H(draw_vb_obj->mem + start), len);
+                           p->vb->mem, p->vb->size, p->vb->usage, p->vb->fvf, p->vb->version, p->vb_start,
+                           p->vb_start + len, sstride[0]);
+                memcpy(p->vb->gl_check + p->vb_start, G2H(p->vb->mem + p->vb_start), len);
             }
         }
         if (vb_gl) {
-            for (int k = 0; k < 4; k++) pbase[k] = (const uint8_t *)(uintptr_t)start;
-            if (indices && draw_ib_obj) ib_gl = ibo_for(draw_ib_obj);
+            for (int k = 0; k < 4; k++) pbase[k] = (const uint8_t *)(uintptr_t)p->vb_start;
+            if (indices && p->ib && (!pinned || p->ib_cached)) ib_gl = ibo_for(p->ib, pinned ? p->ib_ver : p->ib->version, pinned);
         }
     }
     glBindBuffer(GL_ARRAY_BUFFER, vb_gl);
@@ -1434,7 +1497,7 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib_gl);
     if (ib_gl) {
         glDrawElements(gl_prim(prim), (GLsizei)index_count, index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
-                       (const void *)(uintptr_t)((const uint8_t *)indices - (const uint8_t *)G2H(draw_ib_obj->mem)));
+                       (const void *)(uintptr_t)p->ib_off);
     } else if (indices) {
         glDrawElements(gl_prim(prim), (GLsizei)index_count, index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, indices);
     } else {
@@ -1447,9 +1510,22 @@ static void draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0,
     }
 }
 
-void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t count, uint32_t rects)
+static void rq_record_draw(d3d_device *d, draw_pkt *p);
+void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,
+             const void *indices, int index32, uint32_t index_count)
 {
-    (void)count; (void)rects;
+    draw_pkt p;
+    uint64_t t0 = plat_ticks_us();
+    if (!prepare_draw(d, &p, prim, vbase, stride0, first_vertex, num_vertices, indices, index32, index_count)) return;
+    if (gl_rq_mode) { rq_record_draw(d, &p); rq_rec_us += plat_ticks_us() - t0; return; }
+    mv = movie_now();
+    exec_draw(d, &p);
+    prof_draw_us += plat_ticks_us() - t0;
+    prof_draws++;
+}
+
+static void exec_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil)
+{
     GLbitfield m = 0;
     set_viewport(d);
     glDisable(GL_SCISSOR_TEST);
@@ -1471,12 +1547,22 @@ void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t s
     glDisable(GL_SCISSOR_TEST);
 }
 
+static void rq_record_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil);
+void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t count, uint32_t rects)
+{
+    (void)count; (void)rects;
+    if (gl_rq_mode) rq_record_clear(d, flags, color, z, stencil);
+    else exec_clear(d, flags, color, z, stencil);
+}
+
+/* No GL work: the render side gets rt0 with the device state. */
 void gl_set_render_target(d3d_device *d, d3d_surf *s)
 {
     static int warned;
     if (s && !s->is_backbuffer && !warned++)
         rt_log("[d3d] render targets other than the back buffer are not implemented yet\n");
     d->rt0 = s;
+    DEV_TOUCH(d, rt0);
 }
 
 static GLuint *pending_deletes;
@@ -1626,7 +1712,8 @@ static void draw_vita_overlay(uint32_t frame)
     glColor4f(1, 1, 1, 1);
 }
 
-void gl_present(d3d_device *d)
+/* The GL half of Present (the render thread in mode 1); the game thread counts the frame. */
+static void exec_present(d3d_device *d, int overlay)
 {
     pthread_mutex_lock(&pending_lock);
     if (pending_count) {
@@ -1640,7 +1727,6 @@ void gl_present(d3d_device *d)
         pending_buf_count = 0;
     }
     pthread_mutex_unlock(&pending_lock);
-    d3d_frame_now = d->frame;
     /* A file dump.req in the game directory asks the running game for a screenshot now and a draw dump of the next frame. */
     if (d->frame % 30 == 0 && access("dump.req", F_OK) == 0) {
         remove("dump.req");
@@ -1669,7 +1755,7 @@ void gl_present(d3d_device *d)
                 if (f) { fwrite(G2H(0x580000U), 1, 0x380000U, f); fclose(f); }
             }
     }
-    if (tmnt_pad_settings_active()) draw_vita_overlay(d->frame);
+    if (overlay) draw_vita_overlay(d->frame);
     if ((int)d->frame == shot_frame || (shot_every && d->frame % (uint32_t)shot_every == 0)) {
         char name[64];
         snprintf(name, sizeof name, "frame_%04u.png", d->frame);
@@ -1684,12 +1770,12 @@ void gl_present(d3d_device *d)
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    d->frame++;
+    uint32_t next = d->frame + 1;
     uint64_t now = plat_ticks_us();
-    if (d->frame % 300 == 0) {
+    if (next % 300 == 0) {
         extern uint64_t d3d_tex_bytes, d3d_buf_bytes;
         extern uint32_t d3d_tex_count;
-        rt_log("[d3d] frame %u, %.1f fps, guest heap %u MB, live %u MB (textures %u: %llu MB, buffers %llu MB)\n", d->frame,
+        rt_log("[d3d] frame %u, %.1f fps, guest heap %u MB, live %u MB (textures %u: %llu MB, buffers %llu MB)\n", next,
                last_present_us ? 1e6 / (double)(now - last_present_us) : 0.0, rt_heap_used() >> 20, rt_heap_live() >> 20, d3d_tex_count,
                (unsigned long long)(d3d_tex_bytes >> 20), (unsigned long long)(d3d_buf_bytes >> 20));
         double frames = 300.0, total = prof_frame_start ? (double)(now - prof_frame_start) / frames / 1000.0 : 0.0;
@@ -1697,6 +1783,12 @@ void gl_present(d3d_device *d)
         rt_log("[prof] per frame: %.1f ms = draws %.1f ms (%u draws, uploads %.1f ms, %u textures %llu KB) + swap %.1f ms + game %.1f ms\n",
                total, dr, prof_draws / 300U, (double)prof_upload_us / frames / 1000.0, prof_uploads / 300U,
                (unsigned long long)(prof_upload_bytes / 300U / 1024U), sw, total - dr - sw);
+        if (gl_rq_mode == 1)
+            rt_log("[rq] game thread: %.2f ms per frame recording draws, %.2f ms waiting for the render thread; commands %u KB per frame\n",
+                   (double)rq_rec_us / frames / 1000.0, (double)rq_wait_us / frames / 1000.0, (unsigned)(rq_bytes / 300U / 1024U));
+        rq_wait_us = 0;
+        rq_bytes = 0;
+        rq_rec_us = 0;
         rt_prof_report(300);
         if (draw_timing > 0) {
             rt_log("[draw] per frame: states+positions %.2f ms, colours %.2f ms, stages+texcoords %.2f ms, vitaGL %.2f ms; %llu vertices "
@@ -1718,7 +1810,361 @@ void gl_present(d3d_device *d)
     GLenum e = glGetError();
     if (e != GL_NO_ERROR) {
         static int n;
-        if (n++ < 20) rt_log("[gl] error 0x%x before frame %u\n", e, d->frame);
+        if (n++ < 20) rt_log("[gl] error 0x%x before frame %u\n", e, next);
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------------------- render thread --- */
+/* The game thread records each frame's GL work into a command arena: device changes, draws with copies of the vertex data the
+ * game may overwrite (whatever the GL buffer cache does not hold), clears, Present. The render thread replays a frame on its copy
+ * of the device while the game thread runs the next one; the game thread waits only if the render thread is still on the frame
+ * before. Textures and buffers the game lets go are freed once the frame that last used them has been replayed. */
+
+#define DEV_BLOCK 64U
+#define DEV_BLOCKS ((uint32_t)((sizeof(d3d_device) + DEV_BLOCK - 1) / DEV_BLOCK))
+static d3d_device rdev;                          /* the render side's copy of the device */
+static uint32_t dev_dirty[(DEV_BLOCKS + 31) / 32];
+static uint8_t *dev_shadow;                      /* TMNT_RQ_CHECK=1: what the copy holds, to catch changes made without DEV_TOUCH */
+
+typedef struct { uint8_t *base; size_t size, used; } rq_arena;
+static rq_arena arenas[2];
+static int rq_cur;
+enum { RQ_STATE = 1, RQ_MOVIE, RQ_DRAW, RQ_CLEAR, RQ_DESTROY, RQ_PRESENT };
+typedef struct { uint32_t type, size; } rq_hdr;
+typedef struct { uint32_t offset, len; } rq_state;
+typedef struct { uint32_t flags, color, stencil; float z; } rq_clear;
+typedef struct { void *obj; int is_tex; } rq_destroy;
+typedef struct { int overlay; } rq_present;
+
+static rt_cond rq_cv;
+static int rq_busy;                              /* the render thread has a frame to replay */
+static rq_arena *rq_submitted;
+static volatile uint32_t rq_done;                /* frames replayed so far */
+
+typedef struct grave { void *obj; int is_tex; uint32_t frame; struct grave *next; } grave;
+static grave *grave_new, *grave_wait;            /* let go since the last Present (any thread) / handed to the render side */
+static pthread_mutex_t grave_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Any thread: the game's loader thread releases textures too. */
+void gl_dev_touch(d3d_device *d, const void *field, uint32_t size)
+{
+    if (!gl_rq_mode || !size) return;
+    uint32_t from = (uint32_t)((const uint8_t *)field - (const uint8_t *)d), to = from + size - 1;
+    for (uint32_t b = from / DEV_BLOCK; b <= to / DEV_BLOCK; b++) __sync_fetch_and_or(&dev_dirty[b >> 5], 1U << (b & 31));
+}
+
+static size_t rq_alloc(size_t n)
+{
+    rq_arena *a = &arenas[rq_cur];
+    n = (n + 7) & ~(size_t)7;
+    if (a->used + n > a->size) {
+        size_t size = a->size ? a->size : (size_t)1 << 20;
+        while (a->used + n > size) size *= 2;
+        a->base = realloc(a->base, size);   /* the render thread is replaying the other arena */
+        a->size = size;
+    }
+    size_t at = a->used;
+    a->used += n;
+    return at;
+}
+
+/* A command with a body of the given size; returns the body's offset (arena memory moves when it grows). */
+static size_t rq_cmd(uint32_t type, size_t body)
+{
+    size_t at = rq_alloc(sizeof(rq_hdr) + body);
+    rq_hdr *h = (rq_hdr *)(arenas[rq_cur].base + at);
+    h->type = type;
+    h->size = (uint32_t)((sizeof(rq_hdr) + body + 7) & ~(size_t)7);
+    return at + sizeof(rq_hdr);
+}
+#define RQ_AT(off) (arenas[rq_cur].base + (off))
+
+/* Device blocks changed since the last command, then the movie picture of the moment. */
+static void rq_sync(d3d_device *d)
+{
+    for (uint32_t w = 0; w < (DEV_BLOCKS + 31) / 32; w++) {
+        uint32_t bits = __sync_fetch_and_and(&dev_dirty[w], 0U);
+        while (bits) {
+            uint32_t b0 = (uint32_t)__builtin_ctz(bits), b1 = b0;
+            while (b1 < 31 && ((bits >> (b1 + 1)) & 1U)) b1++;
+            uint32_t from = (w * 32 + b0) * DEV_BLOCK, to = (w * 32 + b1 + 1) * DEV_BLOCK;
+            if (to > sizeof *d) to = (uint32_t)sizeof *d;
+            size_t body = rq_cmd(RQ_STATE, sizeof(rq_state) + (to - from));
+            rq_state *st = (rq_state *)RQ_AT(body);
+            st->offset = from;
+            st->len = to - from;
+            memcpy(RQ_AT(body) + sizeof(rq_state), (const uint8_t *)d + from, to - from);
+            if (dev_shadow) memcpy(dev_shadow + from, (const uint8_t *)d + from, to - from);
+            uint32_t run = (b1 == 31 ? 0xFFFFFFFFU : (1U << (b1 + 1)) - 1U) & ~((1U << b0) - 1U);
+            bits &= ~run;
+        }
+    }
+    if (dev_shadow && memcmp(dev_shadow, d, sizeof *d)) {
+        static int reports;
+        const uint8_t *a = dev_shadow, *b = (const uint8_t *)d;
+        uint32_t at = 0;
+        while (a[at] == b[at]) at++;
+        if (reports++ < 20) rt_log("[rq] device byte %u changed without DEV_TOUCH (frame %u)\n", at, d->frame);
+        gl_dev_touch(d, d, (uint32_t)sizeof *d);
+        rq_sync(d);
+        return;
+    }
+    movie_state m = movie_now();
+    if (m.pin != mv_sent.pin || m.w != mv_sent.w || m.h != mv_sent.h || m.slot != mv_sent.slot || m.rgba_mem != mv_sent.rgba_mem) {
+        size_t body = rq_cmd(RQ_MOVIE, sizeof m);
+        memcpy(RQ_AT(body), &m, sizeof m);
+        mv_sent = m;
+    }
+}
+
+static void rq_record_draw(d3d_device *d, draw_pkt *p)
+{
+    rq_sync(d);
+    /* Vertex data the GL buffer cache does not serve is copied: the game may rewrite it before the render thread draws. */
+    int copy_streams = p->vbo != 1 || p->ovl_slot > 0;
+    size_t sz[4] = { 0, 0, 0, 0 }, isz = 0, data = 0, pkt = (sizeof *p + 7) & ~(size_t)7;
+    if (copy_streams)
+        for (int k = 0; k < 4; k++)
+            if (k == 0 || p->sbase[k] != p->sbase[0] || p->sstride[k] != p->sstride[0]) {
+                sz[k] = ((size_t)p->total * p->sstride[k] + 7) & ~(size_t)7;
+                data += sz[k];
+            }
+    if (p->indices && (p->vbo != 1 || !p->ib_cached)) {
+        isz = ((size_t)p->index_count * (p->index32 ? 4U : 2U) + 7) & ~(size_t)7;
+        data += isz;
+    }
+    size_t body = rq_cmd(RQ_DRAW, pkt + data), off = body + pkt;
+    if (copy_streams) {
+        for (int k = 0; k < 4; k++) {
+            if (sz[k]) {
+                memcpy(RQ_AT(off), p->sbase[k], (size_t)p->total * p->sstride[k]);
+                p->soff[k] = (int32_t)off;
+                off += sz[k];
+            } else {
+                p->soff[k] = p->soff[0];
+            }
+        }
+    }
+    if (isz) {
+        memcpy(RQ_AT(off), p->indices, (size_t)p->index_count * (p->index32 ? 4U : 2U));
+        p->ioff = (int32_t)off;
+    }
+    memcpy(RQ_AT(body), p, sizeof *p);
+}
+
+static void rq_record_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil)
+{
+    rq_sync(d);
+    size_t body = rq_cmd(RQ_CLEAR, sizeof(rq_clear));
+    rq_clear *c = (rq_clear *)RQ_AT(body);
+    c->flags = flags;
+    c->color = color;
+    c->stencil = stencil;
+    c->z = z;
+}
+
+/* The memory of a texture or buffer, once no frame in flight uses it (game thread). */
+static void free_texture(d3d_tex *t)
+{
+    for (uint32_t l = 0; l < t->levels; l++) { rt_free(t->mem[l]); free(t->surf[l]); }
+    free(t);
+}
+static void free_buffer(d3d_buf *b) { rt_free(b->mem); free(b); }
+
+static void grave_add(void *obj, int is_tex)
+{
+    grave *g = malloc(sizeof *g);
+    g->obj = obj;
+    g->is_tex = is_tex;
+    pthread_mutex_lock(&grave_lock);
+    g->next = grave_new;
+    grave_new = g;
+    pthread_mutex_unlock(&grave_lock);
+}
+
+void gl_texture_release(d3d_tex *t)
+{
+    if (gl_rq_mode) { grave_add(t, 1); return; }
+    if (t->gl) gl_defer_delete(t->gl);   /* deleted at the next Present */
+    free_texture(t);
+}
+
+void gl_buffer_release(d3d_buf *b)
+{
+    if (gl_rq_mode) { grave_add(b, 0); return; }
+    if (b->gl_buf) gl_defer_delete_buffer(b->gl_buf);
+    free(b->gl_check);
+    free_buffer(b);
+}
+
+static void rq_execute(rq_arena *a)
+{
+    size_t at = 0;
+    while (at < a->used) {
+        rq_hdr *h = (rq_hdr *)(a->base + at);
+        uint8_t *body = (uint8_t *)(h + 1);
+        switch (h->type) {
+        case RQ_STATE: {
+            const rq_state *st = (const rq_state *)body;
+            memcpy((uint8_t *)&rdev + st->offset, body + sizeof *st, st->len);
+            break;
+        }
+        case RQ_MOVIE:
+            memcpy(&mv, body, sizeof mv);
+            break;
+        case RQ_DRAW: {
+            draw_pkt p;
+            memcpy(&p, body, sizeof p);
+            for (int k = 0; k < 4; k++) if (p.soff[k] >= 0) p.sbase[k] = a->base + p.soff[k];
+            if (p.ioff >= 0) p.indices = a->base + p.ioff;
+            uint64_t t0 = plat_ticks_us();
+            exec_draw(&rdev, &p);
+            prof_draw_us += plat_ticks_us() - t0;
+            prof_draws++;
+            break;
+        }
+        case RQ_CLEAR: {
+            const rq_clear *c = (const rq_clear *)body;
+            exec_clear(&rdev, c->flags, c->color, c->z, c->stencil);
+            break;
+        }
+        case RQ_DESTROY: {
+            const rq_destroy *x = (const rq_destroy *)body;
+            if (x->is_tex) {
+                d3d_tex *t = x->obj;
+                if (t->gl) gl_defer_delete(t->gl);
+            } else {
+                d3d_buf *b = x->obj;
+                if (b->gl_buf) gl_defer_delete_buffer(b->gl_buf);
+                free(b->gl_check);
+                b->gl_check = NULL;
+            }
+            break;
+        }
+        case RQ_PRESENT:
+            exec_present(&rdev, ((const rq_present *)body)->overlay);
+            __sync_synchronize();
+            rq_done = rdev.frame + 1;
+            break;
+        }
+        at += h->size;
+    }
+}
+
+static void *render_main(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(0, 2);
+    plat_thread_label("render");
+    plat_gl_thread(1);
+    for (;;) {
+        rt_cond_lock(&rq_cv);
+        while (!rq_busy) rt_cond_wait_ms(&rq_cv, 0xFFFFFFFFU);
+        rq_arena *a = rq_submitted;
+        rt_cond_unlock(&rq_cv);
+        rq_execute(a);
+        rt_cond_lock(&rq_cv);
+        rq_busy = 0;
+        rt_cond_broadcast(&rq_cv);
+        rt_cond_unlock(&rq_cv);
+    }
+    return NULL;
+}
+
+/* Hands the recorded frame to the render thread once it is done with the one before, and starts the next on the free arena. */
+static void rq_submit(void)
+{
+    uint64_t t0 = plat_ticks_us();
+    rt_cond_lock(&rq_cv);
+    while (rq_busy) rt_cond_wait_ms(&rq_cv, 0xFFFFFFFFU);
+    rq_submitted = &arenas[rq_cur];
+    rq_busy = 1;
+    rt_cond_broadcast(&rq_cv);
+    rt_cond_unlock(&rq_cv);
+    rq_wait_us += plat_ticks_us() - t0;
+    rq_cur ^= 1;
+    arenas[rq_cur].used = 0;
+}
+
+/* Called by gl_init_device once the device is set up (game thread). */
+static void rq_start(d3d_device *d)
+{
+    const char *e = getenv("TMNT_RENDER_THREAD");
+#ifdef __vita__
+    gl_rq_mode = e ? atoi(e) : 1;
+#else
+    gl_rq_mode = e ? atoi(e) : 0;
+#endif
+    if (gl_rq_mode != 1 && gl_rq_mode != 2) { gl_rq_mode = 0; return; }
+    rdev = *d;
+    memset(dev_dirty, 0, sizeof dev_dirty);
+    if (getenv("TMNT_RQ_CHECK") && atoi(getenv("TMNT_RQ_CHECK"))) {
+        dev_shadow = malloc(sizeof *d);
+        memcpy(dev_shadow, d, sizeof *d);
+    }
+    rt_cond_init(&rq_cv);
+    if (gl_rq_mode == 1) {
+        plat_gl_thread(0);   /* the GL context goes to the render thread */
+        pthread_t t;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, 512 * 1024);
+        int r = pthread_create(&t, &a, render_main, NULL);
+        pthread_attr_destroy(&a);
+        if (r) { plat_gl_thread(1); gl_rq_mode = 2; } else pthread_detach(t);
+    }
+    rt_log("[rq] GL work %s%s\n", gl_rq_mode == 1 ? "on a render thread" : "recorded and replayed at Present",
+           dev_shadow ? ", device copy checked" : "");
+}
+
+void gl_present(d3d_device *d)
+{
+    int overlay = tmnt_pad_settings_active();
+    if (!gl_rq_mode) {
+        d3d_frame_now = d->frame;
+        exec_present(d, overlay);
+        d->frame++;
+    } else {
+        rq_sync(d);
+        /* Textures and buffers let go since the last Present: the render side drops their GL objects after this frame. */
+        pthread_mutex_lock(&grave_lock);
+        grave *g = grave_new;
+        grave_new = NULL;
+        pthread_mutex_unlock(&grave_lock);
+        while (g) {
+            grave *n = g->next;
+            size_t body = rq_cmd(RQ_DESTROY, sizeof(rq_destroy));
+            rq_destroy *x = (rq_destroy *)RQ_AT(body);
+            x->obj = g->obj;
+            x->is_tex = g->is_tex;
+            g->frame = d->frame;
+            g->next = grave_wait;
+            grave_wait = g;
+            g = n;
+        }
+        size_t body = rq_cmd(RQ_PRESENT, sizeof(rq_present));
+        ((rq_present *)RQ_AT(body))->overlay = overlay;
+        rq_bytes += arenas[rq_cur].used;
+        d3d_frame_now = d->frame;
+        if (gl_rq_mode == 2) {
+            rq_execute(&arenas[rq_cur]);
+            arenas[rq_cur].used = 0;
+        } else {
+            rq_submit();
+        }
+        d->frame++;
+        DEV_TOUCH(d, frame);
+        __sync_synchronize();
+        for (grave **pp = &grave_wait; *pp;) {
+            grave *x = *pp;
+            if (rq_done > x->frame) {
+                *pp = x->next;
+                if (x->is_tex) free_texture(x->obj); else free_buffer(x->obj);
+                free(x);
+            } else {
+                pp = &x->next;
+            }
+        }
     }
     if (!plat_pump()) {
         rt_log("[plat] quit requested\n");

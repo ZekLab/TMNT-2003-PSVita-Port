@@ -311,3 +311,12 @@ int plat_audio_start(void (*mix)(int16_t *out, int frames))
 }
 
 void plat_power_info(int *arm, int *gpu, int *battery) { *arm = *gpu = *battery = 0; }
+
+/* The [cpu] line is Vita only. */
+void plat_thread_label(const char *name) { (void)name; }
+void plat_cpu_report(void) {}
+
+void plat_gl_thread(int take)
+{
+    if (SDL_GL_MakeCurrent(window, take ? glctx : NULL) != 0) rt_log("[plat] SDL_GL_MakeCurrent(%d): %s\n", take, SDL_GetError());
+}

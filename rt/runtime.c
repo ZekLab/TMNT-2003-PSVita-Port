@@ -104,6 +104,7 @@ static void *rdtsc_ticker(void *arg)
 {
     (void)arg;
     rt_thread_place_self(0, 15);
+    plat_thread_label("rdtsc");
     for (;;) {
         rdtsc_cache_lo = sceKernelGetProcessTimeLow();
         sceKernelDelayThread(100);
@@ -151,6 +152,13 @@ static int fnset_on;
 static uint8_t fnset_bits[0x200000 / 8];
 static CPU *prof_cpu;
 static volatile uint32_t prof_cur_fn;
+/* Exact-profile build (rt/guest.h, GUEST_PROF_EXCL): the function running on the profiled thread; 0x0FFFFFFE inside a host API. */
+struct CPU *guest_prof_cpu;
+volatile uint32_t guest_prof_fn;
+#ifdef GUEST_PROF_EXCL
+int tmnt_phase(void);   /* game_tmnt.c: 1 logic, 2 draw, 3 present + pace */
+#define PROF_HOST 0x0FFFFFFEU
+#endif
 static uint64_t prof_thunk_us[RT_MAX_THUNKS];
 static uint32_t prof_thunk_n[RT_MAX_THUNKS];
 #define PROF_SLOTS 8192
@@ -461,7 +469,14 @@ void rt_thunk_call(CPU *__restrict c, uint32_t addr)
     uint32_t ret;
     if (prof_on && c == prof_cpu) {
         uint64_t t0 = rt_now_us();
+#ifdef GUEST_PROF_EXCL
+        uint32_t keep = guest_prof_fn;
+        guest_prof_fn = PROF_HOST;
         ret = t->fn(c);
+        guest_prof_fn = keep;
+#else
+        ret = t->fn(c);
+#endif
         prof_thunk_us[i] += rt_now_us() - t0;
         prof_thunk_n[i]++;
     } else {
@@ -476,9 +491,14 @@ static void *prof_sampler(void *arg)
 {
     (void)arg;
     rt_thread_place_self(0, 15);
+    plat_thread_label("prof");
     for (;;) {
         rt_sleep_us(500);
+#ifdef GUEST_PROF_EXCL
+        uint32_t rva = guest_prof_fn | ((uint32_t)tmnt_phase() << 28), h = (rva * 2654435761U) >> 19;
+#else
         uint32_t rva = prof_cur_fn, h = (rva * 2654435761U) >> 19;
+#endif
         for (uint32_t k = 0; k < PROF_SLOTS; k++, h = (h + 1) & (PROF_SLOTS - 1)) {
             if (prof_fn_rva[h] == rva || prof_fn_hits[h] == 0) { prof_fn_rva[h] = rva; prof_fn_hits[h]++; break; }
         }
@@ -517,6 +537,27 @@ void rt_prof_report(uint32_t frames)
     memset(prof_thunk_us, 0, sizeof prof_thunk_us);
     memset(prof_thunk_n, 0, sizeof prof_thunk_n);
     uint32_t total = prof_samples;
+#ifdef GUEST_PROF_EXCL
+    /* Per phase: its share of the samples, then its functions by share of the phase (host = inside host APIs). */
+    static const char *phase_name[4] = { "other", "logic", "draw", "pace" };
+    uint32_t phase_total[4] = { 0, 0, 0, 0 };
+    for (uint32_t h = 0; h < PROF_SLOTS; h++) if (prof_fn_hits[h]) phase_total[(prof_fn_rva[h] >> 28) & 3U] += prof_fn_hits[h];
+    for (uint32_t ph = 0; ph < 4 && total; ph++) {
+        if (!phase_total[ph]) continue;
+        rt_log("[prof] phase %s %.1f%% of the samples\n", phase_name[ph], 100.0 * phase_total[ph] / total);
+        for (int r = 0; r < 25; r++) {
+            uint32_t best = PROF_SLOTS;
+            for (uint32_t h = 0; h < PROF_SLOTS; h++)
+                if (prof_fn_hits[h] && ((prof_fn_rva[h] >> 28) & 3U) == ph && (best == PROF_SLOTS || prof_fn_hits[h] > prof_fn_hits[best])) best = h;
+            if (best == PROF_SLOTS) break;
+            uint32_t rva = prof_fn_rva[best] & 0x0FFFFFFFU;
+            if (rva == PROF_HOST) rt_log("[prof]   %s host APIs %5.1f%%\n", phase_name[ph], 100.0 * prof_fn_hits[best] / phase_total[ph]);
+            else rt_log("[prof]   %s fn %08x %5.1f%%\n", phase_name[ph], rva + GUEST_IMAGE_BASE, 100.0 * prof_fn_hits[best] / phase_total[ph]);
+            prof_fn_hits[best] = 0;
+        }
+    }
+    total = 0;
+#endif
     for (int r = 0; r < 15 && total; r++) {
         uint32_t best = 0;
         for (uint32_t h = 1; h < PROF_SLOTS; h++) if (prof_fn_hits[h] > prof_fn_hits[best]) best = h;
@@ -799,6 +840,7 @@ static int game_main(int argc, char **argv)
     init_teb(c);
     rt_win32_init(c);
     prof_cpu = c;
+    if (prof_on) guest_prof_cpu = c;
 #ifdef __vita__
     rdtsc_cache_lo = sceKernelGetProcessTimeLow();
     {
@@ -831,6 +873,7 @@ static void *game_thread(void *arg)
 {
     (void)arg;
     rt_thread_place_self(1, 0);
+    plat_thread_label("main");
     char *argv[] = { "tmnt", NULL };
     game_exit = game_main(1, argv);
     return NULL;

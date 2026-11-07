@@ -1,16 +1,19 @@
 # Mac host build of the translated TMNT_EN.EXE: make -j8 (generated C must exist: recomp/gen_c.py + recomp/gen_tables.py).
+# Variants: make VARIANT=macprof EXTRA=-DGUEST_PROF_EXCL builds the exact-profile binary in build/macprof (rt/guest.h).
 GEN := recomp/out/c
-OBJ := build/mac/obj
+VARIANT ?= mac
+EXTRA ?=
+OBJ := build/$(VARIANT)/obj
 CC := clang
-GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 -DGUEST_GPR_LOCAL=1 -DGUEST_X87_LOCAL=1 -DGUEST_MEMBASE_LOCAL=1 -DGUEST_FLAGS_LOCAL=1
-RTFLAGS := -O1 -g -Wall -Wno-unused-function -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 $(shell sdl2-config --cflags)
+GENFLAGS := -O1 -w -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 -DGUEST_GPR_LOCAL=1 -DGUEST_X87_LOCAL=1 -DGUEST_MEMBASE_LOCAL=1 -DGUEST_FLAGS_LOCAL=1 $(EXTRA)
+RTFLAGS := -O1 -g -Wall -Wno-unused-function -std=gnu11 -Irt -DGUEST_GENERATED_STACK_GUARD=0 $(shell sdl2-config --cflags) $(EXTRA)
 
 GEN_SRC := $(wildcard $(GEN)/guest_*.c) $(GEN)/dispatch.c $(GEN)/imports.c
 RT_SRC := rt/runtime.c rt/win32.c rt/com.c rt/d3d9.c rt/d3d9_gl.c rt/plat_sdl.c rt/dinput.c rt/dsound.c rt/game_tmnt.c rt/movie.c rt/par.c
 GEN_OBJ := $(patsubst $(GEN)/%.c,$(OBJ)/gen/%.o,$(GEN_SRC))
 RT_OBJ := $(patsubst rt/%.c,$(OBJ)/rt/%.o,$(RT_SRC))
 
-build/mac/tmnt: $(GEN_OBJ) $(RT_OBJ)
+build/$(VARIANT)/tmnt: $(GEN_OBJ) $(RT_OBJ)
 	$(CC) -o $@ $^ -lm -lpthread -lz $(shell sdl2-config --libs) -framework OpenGL
 
 $(OBJ)/gen/%.o: $(GEN)/%.c rt/guest.h rt/game_hooks.h
@@ -22,4 +25,4 @@ $(OBJ)/rt/%.o: rt/%.c rt/guest.h rt/runtime.h rt/com.h rt/d3d9.h rt/plat.h
 	$(CC) $(RTFLAGS) -c $< -o $@
 
 clean:
-	rm -rf build/mac
+	rm -rf build/$(VARIANT)

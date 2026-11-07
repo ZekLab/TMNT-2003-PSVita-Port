@@ -328,6 +328,16 @@ extern volatile int guest_trace_on;
 void guest_trace_enter(struct CPU *c, uint32_t rva);
 #ifdef GUEST_NO_TRACE
 #define GUEST_ENTER(rva) ((void)0)
+#elif defined(GUEST_PROF_EXCL)
+/* Exact-profile build (TMNT_PROF=1): guest_prof_fn is the function the profiled thread is running, put back on every way out of
+ * a function (cleanup), so a sample goes to the function running and not to the last one entered. */
+extern struct CPU *guest_prof_cpu;
+extern volatile uint32_t guest_prof_fn;
+typedef struct { struct CPU *c; uint32_t prev; } guest_prof_frame;
+static inline void guest_prof_leave(guest_prof_frame *f) { if (f->c == guest_prof_cpu) guest_prof_fn = f->prev; }
+#define GUEST_ENTER(rva) guest_prof_frame guest_pf __attribute__((cleanup(guest_prof_leave))) = { c, guest_prof_fn }; \
+    if (c == guest_prof_cpu) guest_prof_fn = (rva); \
+    if (__builtin_expect(guest_trace_on, 0)) guest_trace_enter(c, (rva))
 #else
 #define GUEST_ENTER(rva) do { if (__builtin_expect(guest_trace_on, 0)) guest_trace_enter(c, (rva)); } while (0)
 #endif

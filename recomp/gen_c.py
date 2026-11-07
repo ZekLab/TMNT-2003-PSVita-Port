@@ -42,6 +42,7 @@ FASTPATHS = {
     0x0a64aa: "tmnt_fast_anim_curve",       # the game's animation curve (search + cubic): 14.4% of a logic tick
     0x0ef9f0: "tmnt_fast_hanim_attach",     # RpHAnim attach over the frame tree, every character every tick: ~8% of logic
     0x118cd0: "tmnt_fast_sphere_tri",       # sphere/triangle collision, early rejection only: ~6% of logic
+    0x0cc050: "tmnt_fast_rw_flush_states",  # RwD3D9 render/texture stage state flush: thousands of COM calls a frame in fights
     0x1593b0: "tmnt_fast_sfd_yuv_argb",     # Sofdec movie frame YUV -> ARGB: only SSE/MMX versions exist, so movies stayed black
     # Sofdec's own picture is no longer shown (pl_mpeg draws movies): its IDCT and motion compensation become no-ops, so the
     # bitstream is still parsed (pacing, sound) without the decoding work that left no CPU for pl_mpeg on the Vita.

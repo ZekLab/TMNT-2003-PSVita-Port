@@ -6,6 +6,9 @@
 
 #include <stdint.h>
 
+/* Registers the calling thread for the [cpu] line (plat_vita.c; nothing on the Mac), with a name when given. */
+void plat_thread_label(const char *name);
+
 #ifdef __vita__
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -45,6 +48,7 @@ static inline void rt_thread_place_self(int main_core, int win_prio)
 {
     sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), main_core ? 0x00010000 : 0x00060000);  /* user core 0 / cores 1-2 */
     rt_thread_set_priority(sceKernelGetThreadId(), win_prio);
+    plat_thread_label(NULL);
 }
 
 #else

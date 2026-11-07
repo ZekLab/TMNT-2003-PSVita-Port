@@ -35,7 +35,8 @@ struct d3d_tex {
     GLuint gl;
     GLuint gl_movie;   /* Vita: the ring texture holding the current movie frame (d3d9_gl), bound instead of gl */
     int gl_movie_hw;   /* Vita: 1 + the hardware-decoded picture gl_movie shows (movie.h), 0 for none */
-    uint32_t dirty;
+    uint32_t dirty;             /* levels to upload; GL side only */
+    uint32_t dirty_pending;     /* levels written by the game (any thread, atomic or); the GL side moves them into dirty */
     int uploaded;
     uint32_t sampler_key;
 };
@@ -91,6 +92,23 @@ typedef struct d3d_device {
 } d3d_device;
 
 d3d_device *d3d_dev(void);
+/* Render thread (d3d9_gl.c). Mode 0: the game thread makes the GL calls itself. Mode 1: it records them, and a render thread
+ * replays the previous frame meanwhile (TMNT_RENDER_THREAD=1, the Vita's default). Mode 2: recorded and replayed on the game
+ * thread at Present (TMNT_RENDER_THREAD=2, tests the recording on the Mac). The render side keeps a copy of the device: every
+ * change to a device field must go through DEV_TOUCH so the copy gets it (TMNT_RQ_CHECK=1 compares the two and logs misses). */
+extern int gl_rq_mode;
+void gl_dev_touch(d3d_device *d, const void *field, uint32_t size);
+#define DEV_TOUCH(d, field) gl_dev_touch((d), &(d)->field, (uint32_t)sizeof((d)->field))
+/* Textures and buffers whose last reference went: freed once the render side has drawn every frame that used them. */
+void gl_texture_release(d3d_tex *t);
+void gl_buffer_release(d3d_buf *b);
+/* Native calls into the device (d3d9.c), for replacements of the game's RenderWare D3D9 code. */
+int d3d9_is_device(uint32_t guest);
+void d3d9_set_render_state(uint32_t state, uint32_t value);
+void d3d9_set_texture_stage_state(uint32_t stage, uint32_t type, uint32_t value);
+size_t d3d9_states_size(void);
+void d3d9_states_save(uint8_t *buf);
+void d3d9_states_load(const uint8_t *buf);
 void gl_init_device(d3d_device *d);
 void gl_clear(d3d_device *d, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t count, uint32_t rects);
 void gl_draw(d3d_device *d, uint32_t prim, uint32_t vbase, uint32_t stride0, uint32_t first_vertex, uint32_t num_vertices,

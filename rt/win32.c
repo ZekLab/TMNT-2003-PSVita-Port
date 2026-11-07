@@ -638,6 +638,9 @@ static void *thread_main(void *arg)
     rt_thread_ctx *x = h->tctx;
     rt_thread_place_self(0, x->win_prio);
     x->os_id = rt_thread_os_id();
+    char label[24];
+    snprintf(label, sizeof label, "guest %u", x->tid);
+    plat_thread_label(label);
     CPU *c = &x->cpu;
     uint32_t a[1] = { h->param };
     rt_call_guest(c, h->start, 1, a);
@@ -834,6 +837,9 @@ static void *timer_main(void *arg)
     rt_timer *t = arg;
     /* Windows runs multimedia timer callbacks at time-critical priority. */
     rt_thread_place_self(0, 15);
+    char label[24];
+    snprintf(label, sizeof label, "timer %d", (int)(t - timers));
+    plat_thread_label(label);
     for (;;) {
         rt_cond_lock(&t->arm);
         while (!t->running) rt_cond_wait_ms(&t->arm, 0xFFFFFFFFU);

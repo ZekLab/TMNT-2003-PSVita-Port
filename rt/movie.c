@@ -239,7 +239,9 @@ static int hw_free_slot(session *s)
 {
     uint32_t now = vglGetFrameNumber();
     for (int i = 0; i < MOVIE_HW_SLOTS; i++) {
-        if (hw_owner[i] == s && hw_frame[i] >= s->shown) continue;
+        /* The render thread binds a picture up to a frame after the game thread picks it: two older ones stay too. A slot of
+           this movie without a picture (-1: being decoded, or no picture came out yet) is free. */
+        if (hw_owner[i] == s && hw_frame[i] >= 0 && hw_frame[i] >= s->shown - 2) continue;
         if (now - movie_hw_bound_frame[i] < 3) continue;
         return i;
     }
@@ -374,6 +376,7 @@ static void *decoder(void *arg)
     session *s = arg;
     uint64_t t_start = plat_ticks_us();
     rt_thread_place_self(0, 2);
+    plat_thread_label("movie");
 #ifdef __vita__
     if (hw_ready && decode_hw(s, t_start)) {
         while (!s->stop) usleep(10000);

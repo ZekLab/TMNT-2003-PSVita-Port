@@ -57,6 +57,7 @@ int tmnt_fast_rw_xform_points(struct CPU *c);
 int tmnt_fast_rw_matrix_multiply(struct CPU *c);
 /* The game's animation curve (0x4a64aa): key search and cubic interpolation in native code. */
 int tmnt_fast_anim_curve(struct CPU *c);
+int tmnt_fast_rw_flush_states(struct CPU *c);
 /* RpHAnim hierarchy attach callback (0x4ef9f0), recursive over the frame tree, in native code. */
 int tmnt_fast_hanim_attach(struct CPU *c);
 /* Sphere/triangle collision test (0x518cd0): its early rejection in native code. */

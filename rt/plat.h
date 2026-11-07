@@ -27,6 +27,11 @@ void plat_game_size(int *w, int *h);
 void plat_screenshot(const char *path);
 void plat_write_rgba_png(const char *path, const uint8_t *rgba, int w, int h);
 uint64_t plat_ticks_us(void);
+/* [cpu] line (Vita): each host thread's share of a core over the last window; threads register when placed, a name helps. */
+void plat_thread_label(const char *name);
+void plat_cpu_report(void);
+/* The GL context moves to the render thread (d3d9_gl.c): 0 lets go of it on this thread, 1 takes it (nothing to do on the Vita). */
+void plat_gl_thread(int take);
 /* Current CPU/GPU clocks and battery percent (zeros where unknown, e.g. on the Mac). */
 void plat_power_info(int *arm, int *gpu, int *battery);
 /* Starts stereo S16 output pulling from `mix`; returns the output rate. */

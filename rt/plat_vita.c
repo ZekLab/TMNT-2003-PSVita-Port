@@ -242,6 +242,7 @@ static void *audio_thread(void *arg)
 {
     (void)arg;
     rt_thread_place_self(0, 4);
+    plat_thread_label("audio out");
     int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, AUDIO_GRAIN, AUDIO_RATE, SCE_AUDIO_OUT_MODE_STEREO);
     if (port < 0) {
         rt_log("[plat] sceAudioOutOpenPort: %08x\n", port);
@@ -282,3 +283,55 @@ int plat_audio_start(void (*mix)(int16_t *out, int frames))
     rt_log("[plat] audio %d Hz, %d frames per block\n", AUDIO_RATE, AUDIO_GRAIN);
     return AUDIO_RATE;
 }
+
+/* [cpu]: each registered thread's share of one core over the last report window (SceKernelThreadInfo.runClocks, microseconds).
+   Threads register when rt_thread_place_self places them; plat_thread_label names them. */
+#define CPU_THREADS 48
+static struct { SceUID id; char name[24]; uint64_t last; } cpu_threads[CPU_THREADS];
+static volatile int cpu_count;
+static uint64_t cpu_last_us;
+
+void plat_thread_label(const char *name)
+{
+    SceUID id = sceKernelGetThreadId();
+    int n = cpu_count < CPU_THREADS ? cpu_count : CPU_THREADS;
+    for (int i = 0; i < n; i++) {
+        if (cpu_threads[i].id != id) continue;
+        if (name) snprintf(cpu_threads[i].name, sizeof cpu_threads[i].name, "%s", name);
+        return;
+    }
+    int i = __sync_fetch_and_add(&cpu_count, 1);
+    if (i >= CPU_THREADS) return;
+    snprintf(cpu_threads[i].name, sizeof cpu_threads[i].name, "%s", name ? name : "thread");
+    __sync_synchronize();
+    cpu_threads[i].id = id;
+}
+
+void plat_cpu_report(void)
+{
+    uint64_t now = sceKernelGetSystemTimeWide(), span = now - cpu_last_us;
+    int first = cpu_last_us == 0;
+    cpu_last_us = now;
+    char line[768];
+    int len = snprintf(line, sizeof line, "[cpu]");
+    double side = 0;
+    int n = cpu_count < CPU_THREADS ? cpu_count : CPU_THREADS;
+    for (int i = 0; i < n; i++) {
+        if (!cpu_threads[i].id) continue;
+        SceKernelThreadInfo info;
+        memset(&info, 0, sizeof info);
+        info.size = sizeof info;
+        if (sceKernelGetThreadInfo(cpu_threads[i].id, &info) < 0) continue;
+        uint64_t run = info.runClocks, d = run - cpu_threads[i].last;
+        cpu_threads[i].last = run;
+        if (first || !span) continue;
+        double pct = 100.0 * (double)d / (double)span;
+        if (!(info.currentCpuAffinityMask & 0x10000)) side += pct;   /* placed on cores 1-2 */
+        if (pct >= 1.0 && len < (int)sizeof line - 40)
+            len += snprintf(line + len, sizeof line - len, " %s %.0f%%,", cpu_threads[i].name, pct);
+    }
+    if (!first) rt_log("%s cores 1-2 busy %.0f%% of 200%%\n", line, side);
+}
+
+/* vitaGL has no per-thread context: the render thread just makes the calls. */
+void plat_gl_thread(int take) { (void)take; }

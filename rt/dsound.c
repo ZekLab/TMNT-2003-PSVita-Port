@@ -319,6 +319,7 @@ static void *silent_mixer(void *arg)
 {
     (void)arg;
     rt_thread_place_self(0, 2);
+    plat_thread_label("silent mixer");
     static int16_t scratch[2 * 4410];
     uint64_t last = plat_ticks_us();
     for (;;) {
