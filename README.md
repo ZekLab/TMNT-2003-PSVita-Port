@@ -151,6 +151,10 @@ Open an issue with:
 - `vita/`: the Vita build (`CMakeLists.txt`, LiveArea template).
 - `docs/`: inventory of the executable and the progress log (in Romanian).
 
+## Support
+
+If you enjoy the port, you can [buy me a coffee](https://buymeacoffee.com/tavasiberiu).
+
 ## Legal notice
 
 This project is not affiliated with or endorsed by Konami, Mirage Studios or Nickelodeon. *Teenage Mutant Ninja Turtles*
