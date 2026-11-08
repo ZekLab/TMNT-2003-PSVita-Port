@@ -116,8 +116,16 @@ Without the converted movies the game falls back to a software decoder, which is
 
    This writes the C code to `recomp/out/c/` and the game's memory image to `recomp/out/image.bin`. Both are made from
    your executable and stay on your computer.
-4. **Vita:** with [VitaSDK](https://vitasdk.org) and LLVM installed,
-   `cmake -S vita -B build/vita -DCMAKE_BUILD_TYPE=Release && cmake --build build/vita -j8` gives
+4. **Vita:** install [VitaSDK](https://vitasdk.org) and LLVM. The port needs a newer
+   [vitaGL](https://github.com/Rinnegatamante/vitaGL) than the one in VitaSDK (it uses `vglSetupTexture`): build it
+   into `build/vitagl`, where the build looks for it first:
+
+   ```bash
+   git clone https://github.com/Rinnegatamante/vitaGL build/vitagl
+   make -C build/vitagl NO_DEBUG=1 HAVE_SHADER_CACHE=1
+   ```
+
+   Then `cmake -S vita -B build/vita -DCMAKE_BUILD_TYPE=Release && cmake --build build/vita -j8` gives
    `build/vita/TMNTVita.vpk` and `build/vita/tmnt_code.so`. `-DTMNT_CODE_SO=OFF` links the translated code into the
    eboot instead (local testing only: that VPK contains the game's code and must not be shared).
 5. **Mac (optional, for testing):** `DEVELOPER_DIR=/Library/Developer/CommandLineTools make -j8` (needs SDL2), then
