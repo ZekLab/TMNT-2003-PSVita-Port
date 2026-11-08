@@ -1,5 +1,10 @@
 # Teenage Mutant Ninja Turtles (2003) for PS Vita
 
+## ☕ Enjoying the port? Buy me a coffee
+
+If this port gives you some good hours on your Vita, you can support the work at
+[buymeacoffee.com/tavasiberiu](https://buymeacoffee.com/tavasiberiu).
+
 An unofficial port of *Teenage Mutant Ninja Turtles* (Konami, 2003, PC version) to the PS Vita.
 
 > **This project does not include any game code or data.** You need your own copy of the PC game. The game's executable is
@@ -150,10 +155,6 @@ Open an issue with:
 - `tools/`: table generators, the movie converter (`tools/movies/`), the LiveArea builder and run scripts.
 - `vita/`: the Vita build (`CMakeLists.txt`, LiveArea template).
 - `docs/`: inventory of the executable and the progress log (in Romanian).
-
-## Support
-
-If you enjoy the port, you can [buy me a coffee](https://buymeacoffee.com/tavasiberiu).
 
 ## Legal notice
 
