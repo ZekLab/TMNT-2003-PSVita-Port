@@ -194,6 +194,9 @@ the game.
 
 ## Credits and licenses
 
+This project is licensed under the GNU GPL, version 2 or (at your option) any later version ([LICENSE](LICENSE)), like
+repentogxm.
+
 - [repentogxm](https://github.com/0xl0cal/repentogxm) by 0xl0cal: the x86 → C translator and the guest CPU model this
   port started from (GPL-2.0-or-later).
 - [VitaSDK](https://vitasdk.org) and [vitaGL](https://github.com/Rinnegatamante/vitaGL) (LGPL-3.0): toolchain and
