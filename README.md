@@ -7,8 +7,9 @@ If this port gives you some good hours on your Vita, you can support the work at
 
 An unofficial port of *Teenage Mutant Ninja Turtles* (Konami, 2003, PC version) to the PS Vita.
 
-> **This project does not include any game code or data.** You need your own copy of the PC game. The VPK holds only the
-> port's own code: a script translates the game's executable on your computer, and its data files are copied to the Vita.
+> **This project does not include the game's code or data files.** You need your own copy of the PC game. The VPK holds
+> the port's own code and, for the LiveArea, the game's logo and title art: a script translates the game's executable on
+> your computer, and its data files are copied to the Vita.
 
 ## Status
 
@@ -189,8 +190,8 @@ Open an issue with:
 ## Legal notice
 
 This project is not affiliated with or endorsed by Konami, Mirage Studios or Nickelodeon. *Teenage Mutant Ninja Turtles*
-is a trademark of its respective owners. This project does not distribute game code or data: you need your own copy of
-the game.
+is a trademark of its respective owners. This project does not distribute the game's code or data files (only its logo
+and title art, for the LiveArea): you need your own copy of the game.
 
 ## Credits and licenses
 
