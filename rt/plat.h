@@ -36,5 +36,9 @@ void plat_gl_thread(int take);
 void plat_power_info(int *arm, int *gpu, int *battery);
 /* Starts stereo S16 output pulling from `mix`; returns the output rate. */
 int plat_audio_start(void (*mix)(int16_t *out, int frames));
+#ifdef __vita__
+/* Shows `msg` in a system message box until the user closes it, then ends the app. */
+void plat_fatal(const char *msg) __attribute__((noreturn));
+#endif
 
 #endif

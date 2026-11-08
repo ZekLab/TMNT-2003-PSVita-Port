@@ -9,6 +9,7 @@
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/message_dialog.h>
 
 #include "game_hooks.h"
 #include "osdep.h"
@@ -46,6 +47,30 @@ int plat_video_init(int width, int height)
     rt_log("[plat] vitaGL %dx%d, game %dx%d\n", SCREEN_W, SCREEN_H, width, height);
     inited = 1;
     return 1;
+}
+
+void plat_fatal(const char *msg)
+{
+    rt_log("[fatal] %s\n", msg);
+    if (!inited) vglInit(0);
+    SceMsgDialogUserMessageParam user;
+    memset(&user, 0, sizeof user);
+    user.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
+    user.msg = (const SceChar8 *)msg;
+    SceMsgDialogParam param;
+    sceMsgDialogParamInit(&param);
+    param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+    param.userMsgParam = &user;
+    if (sceMsgDialogInit(&param) >= 0) {
+        while (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            vglSwapBuffers(GL_TRUE);
+        }
+        sceMsgDialogTerm();
+    }
+    sceKernelExitProcess(0);
+    for (;;) {}
 }
 
 void plat_screen_size(int *w, int *h)

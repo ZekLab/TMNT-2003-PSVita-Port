@@ -19,7 +19,8 @@ for _name in ("NORETURN_IMPORTS", "NORETURN_WRAPPERS", "NORETURN_THUNKS", "NORET
 FLAG_RETURNING = frozenset({0x16b405})
 T.FLAG_RETURN_RETS = frozenset({0x16b416, 0x16b447})
 
-EXE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "game", "app", "TMNT_EN.EXE"))
+# TMNT_EXE (tools/make_vita_files.py) points at the user's copy anywhere on disk.
+EXE = os.path.abspath(os.environ.get("TMNT_EXE") or os.path.join(os.path.dirname(__file__), "..", "game", "app", "TMNT_EN.EXE"))
 
 
 # Code patches applied before translation: RVA -> (expected bytes, new bytes, reason). The exe on disk stays untouched.

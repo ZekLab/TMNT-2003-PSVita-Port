@@ -7,8 +7,8 @@ If this port gives you some good hours on your Vita, you can support the work at
 
 An unofficial port of *Teenage Mutant Ninja Turtles* (Konami, 2003, PC version) to the PS Vita.
 
-> **This project does not include any game code or data.** You need your own copy of the PC game. The game's executable is
-> translated to C on your computer and its data files are copied to the Vita.
+> **This project does not include any game code or data.** You need your own copy of the PC game. The VPK holds only the
+> port's own code: a script translates the game's executable on your computer, and its data files are copied to the Vita.
 
 ## Status
 
@@ -40,8 +40,9 @@ Hot paths of the game (skinning, cel shading, animation curves, collision, rende
 | A PS Vita with homebrew enabled (HENkaku/Ensō) | To run the game. |
 | `libshacccg.suprx` extracted on the Vita | vitaGL compiles its shaders with it. |
 | The PC game, English executable `TMNT_EN.EXE` | The code and data come from it. See [Supported version](#supported-version). |
-| A Mac | To build the port and convert the movies (Windows and Linux are not supported yet). |
-| About 2.5 GB free on the Vita | Game data 2.0 GB, converted movies 0.45 GB. |
+| A computer with Python 3.8+ and LLVM (`clang`, `ld.lld`) | To translate the game's code from your executable (one command). Tested on a Mac. |
+| A Mac (optional) | To convert the movies (see [Movies](#movies)). |
+| About 2.5 GB free on the Vita | Game data 1.7 GB, game code 10 MB, converted movies 0.45 GB. |
 
 ### Supported version
 
@@ -54,36 +55,32 @@ The translated code matches one exact executable:
 It comes from the English/Russian PC release, which installs without copy protection. The US and European retail
 discs use SecuROM 4, so their executables are different and do not work.
 
-## Building
-
-1. Extract the game with `innoextract --collisions=rename` into `game/`. The English executable is
-   `game/app/TMNT_EN.EXE`, and `game/app/TMNT.DAT` must point to `TMNT_EN.DAT`.
-2. Fetch the mingw-w64 headers `d3d9.h d3d9types.h d3d9caps.h dinput.h dsound.h` into `ref/headers/`, clone
-   [repentogxm](https://github.com/0xl0cal/repentogxm) into `ref/repentogxm`, and create `.venv` with `pefile` and
-   `capstone`.
-3. Translate the executable:
-
-   ```bash
-   .venv/bin/python recomp/discover.py
-   .venv/bin/python recomp/gen_c.py
-   .venv/bin/python recomp/gen_tables.py
-   ```
-
-   This writes the C code to `recomp/out/c/` and the game's memory image to `recomp/out/image.bin`. Both are made from
-   your executable and stay on your computer.
-4. **Vita:** with [VitaSDK](https://vitasdk.org) installed, `cmake -S vita -B build/vita -DCMAKE_BUILD_TYPE=Release && cmake --build build/vita -j8`
-   gives `build/vita/TMNTVita.vpk` (a full build takes about 10 minutes).
-5. **Mac (optional, for testing):** `DEVELOPER_DIR=/Library/Developer/CommandLineTools make -j8` (needs SDL2), then
-   `tools/play.sh` (`AUDIO=1` for sound).
-
 ## Installation
 
-1. Install `build/vita/TMNTVita.vpk` with VitaShell.
-2. Create `ux0:data/TMNT2003/` and copy into it, from the game folder:
-   `TMNT_EN.DAT` (renamed to `TMNT.DAT`), `TMNT_V00.DAT`, `TMNT_V01.DAT`, `TMNT_V02.DAT`, `bgm.afs`, `se.afs`, `voice.afs`.
-3. Copy `recomp/out/image.bin` to `ux0:data/TMNT2003/`.
-4. Copy the converted movies to `ux0:data/TMNT2003/movies/` (see [Movies](#movies)).
-5. Start the game from the LiveArea.
+The VPK holds only the port's own code. The game's code is translated on your computer from your `TMNT_EN.EXE` into
+`tmnt_code.so`, which the VPK loads at start-up.
+
+1. From the [Releases](../../releases) page, download `TMNTVita.vpk` and the source code of the same release
+   (`Source code (zip)`), and unzip the source code. Install the VPK with VitaShell.
+2. Install the tools on your computer:
+   - Python packages: `python3 -m pip install -r tools/vita_code/requirements.txt`
+   - LLVM: on a Mac `brew install llvm lld`, on Linux `sudo apt install clang lld`, on Windows the LLVM installer
+     from the [LLVM releases](https://github.com/llvm/llvm-project/releases).
+3. In the source folder, run:
+
+   ```bash
+   python3 tools/make_vita_files.py "path/to/the/game" vita_files
+   ```
+
+   The first folder is the installed game (the one with `TMNT_EN.EXE`). The script checks the executable, translates it
+   into `tmnt_code.so` and `image.bin`, and copies the game's data files next to them. It takes about a minute, plus the
+   time to copy 1.7 GB.
+4. Create `ux0:data/TMNT2003/` on the Vita and copy everything in `vita_files` into it.
+5. Optional: copy the converted movies to `ux0:data/TMNT2003/movies/` (see [Movies](#movies)).
+6. Start the game from the LiveArea. If a file is missing, the game says which one.
+
+`tmnt_code.so` and `image.bin` must come from the same release as the VPK: after updating the VPK, run the script
+again.
 
 ### Movies
 
@@ -101,6 +98,30 @@ cd ../.. && build/movconv/movconv game/app build/movies
 This writes 18 `.avc` files (about 450 MB) to `build/movies/`, each checked frame by frame against the original. Copy
 them to `ux0:data/TMNT2003/movies/`. Only the picture is converted: the sound still comes from the game's own files.
 Without the converted movies the game falls back to a software decoder, which is choppy on the Vita.
+
+## Building from source
+
+1. Extract the game with `innoextract --collisions=rename` into `game/`. The English executable is
+   `game/app/TMNT_EN.EXE`, and `game/app/TMNT.DAT` must point to `TMNT_EN.DAT`.
+2. Fetch the mingw-w64 headers `d3d9.h d3d9types.h d3d9caps.h dinput.h dsound.h` into `ref/headers/`, clone
+   [repentogxm](https://github.com/0xl0cal/repentogxm) into `ref/repentogxm`, and create `.venv` with
+   `tools/vita_code/requirements.txt`.
+3. Translate the executable:
+
+   ```bash
+   .venv/bin/python recomp/discover.py
+   .venv/bin/python recomp/gen_c.py
+   .venv/bin/python recomp/gen_tables.py
+   ```
+
+   This writes the C code to `recomp/out/c/` and the game's memory image to `recomp/out/image.bin`. Both are made from
+   your executable and stay on your computer.
+4. **Vita:** with [VitaSDK](https://vitasdk.org) and LLVM installed,
+   `cmake -S vita -B build/vita -DCMAKE_BUILD_TYPE=Release && cmake --build build/vita -j8` gives
+   `build/vita/TMNTVita.vpk` and `build/vita/tmnt_code.so`. `-DTMNT_CODE_SO=OFF` links the translated code into the
+   eboot instead (local testing only: that VPK contains the game's code and must not be shared).
+5. **Mac (optional, for testing):** `DEVELOPER_DIR=/Library/Developer/CommandLineTools make -j8` (needs SDL2), then
+   `tools/play.sh` (`AUDIO=1` for sound).
 
 ## Controls
 
@@ -151,8 +172,9 @@ Open an issue with:
 - `recomp/`: function discovery, translation and C generation. `recomp/xlat/` is a modified copy of the x86 → C
   translator from [repentogxm](https://github.com/0xl0cal/repentogxm).
 - `rt/`: the runtime (guest memory and dispatch, Win32, COM, Direct3D 9, DirectInput, DirectSound, movies, the Mac and
-  Vita platform layers) and the game-specific native code.
-- `tools/`: table generators, the movie converter (`tools/movies/`), the LiveArea builder and run scripts.
+  Vita platform layers, the `tmnt_code.so` loader) and the game-specific native code.
+- `tools/`: `make_vita_files.py` (the user's translation step, with its headers in `tools/vita_code/`), table
+  generators, the movie converter (`tools/movies/`), the LiveArea builder and run scripts.
 - `vita/`: the Vita build (`CMakeLists.txt`, LiveArea template).
 - `docs/`: inventory of the executable and the progress log (in Romanian).
 

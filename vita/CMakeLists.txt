@@ -13,23 +13,27 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(GEN "${ROOT}/recomp/out/c")
-if (NOT EXISTS "${GEN}/dispatch.c")
+# ON: the translated code is not in the VPK; it is loaded from tmnt_code.so, which the user makes with tools/make_vita_files.py.
+option(TMNT_CODE_SO "Load the translated code from tmnt_code.so" ON)
+if (NOT EXISTS "${GEN}/dispatch.c" AND NOT TMNT_CODE_SO)
     message(FATAL_ERROR "Missing generated C in ${GEN}; run recomp/gen_c.py and recomp/gen_tables.py first")
 endif()
 
 file(GLOB GUEST_SOURCES CONFIGURE_DEPENDS "${GEN}/guest_*.c")
 set(RT_SOURCES
     ${ROOT}/rt/runtime.c ${ROOT}/rt/win32.c ${ROOT}/rt/com.c ${ROOT}/rt/d3d9.c ${ROOT}/rt/d3d9_gl.c
-    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c ${ROOT}/rt/movie.c ${ROOT}/rt/par.c)
+    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c ${ROOT}/rt/movie.c ${ROOT}/rt/par.c ${ROOT}/rt/code_so.c)
 
 set(COMMON_FLAGS -std=gnu11 -O2 -mtune=cortex-a9 -mfpu=neon -fno-strict-aliasing)
 
-# Translated code: warnings off, as in the Mac build.
-add_library(guest STATIC ${GUEST_SOURCES} ${GEN}/dispatch.c ${GEN}/imports.c)
-target_compile_options(guest PRIVATE ${COMMON_FLAGS} -w)
-# Guest registers in locals (guest.h GUEST_GPR_LOCAL): with them in the CPU struct GCC reloads them after every guest store.
-target_compile_definitions(guest PRIVATE GUEST_GENERATED_STACK_GUARD=0 GUEST_GPR_LOCAL=1 GUEST_X87_LOCAL=1 GUEST_MEMBASE_LOCAL=1 GUEST_FLAGS_LOCAL=1)
-target_include_directories(guest PRIVATE ${ROOT}/rt)
+if (NOT TMNT_CODE_SO)
+    # Translated code: warnings off, as in the Mac build.
+    add_library(guest STATIC ${GUEST_SOURCES} ${GEN}/dispatch.c ${GEN}/imports.c)
+    target_compile_options(guest PRIVATE ${COMMON_FLAGS} -w)
+    # Guest registers in locals (guest.h GUEST_GPR_LOCAL): with them in the CPU struct GCC reloads them after every guest store.
+    target_compile_definitions(guest PRIVATE GUEST_GENERATED_STACK_GUARD=0 GUEST_GPR_LOCAL=1 GUEST_X87_LOCAL=1 GUEST_MEMBASE_LOCAL=1 GUEST_FLAGS_LOCAL=1)
+    target_include_directories(guest PRIVATE ${ROOT}/rt)
+endif()
 
 add_executable(TMNTVita ${RT_SOURCES})
 target_compile_options(TMNTVita PRIVATE ${COMMON_FLAGS} -Wall -Wno-unused-function)
@@ -43,8 +47,19 @@ if (EXISTS ${ROOT}/build/vitagl/libvitaGL.a)
     target_link_directories(TMNTVita PRIVATE ${ROOT}/build/vitagl)
 endif()
 
+if (TMNT_CODE_SO)
+    target_compile_definitions(TMNTVita PRIVATE TMNT_CODE_SO=1)
+    # The module for local testing (build/vita/tmnt_code.so), when the translated code is here; users make their own.
+    if (EXISTS "${GEN}/dispatch.c")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_custom_target(tmnt_code ALL COMMAND ${Python3_EXECUTABLE} ${ROOT}/tools/make_vita_files.py --code-only ${CMAKE_CURRENT_BINARY_DIR}
+            WORKING_DIRECTORY ${ROOT} VERBATIM)
+    endif()
+else()
+    target_link_libraries(TMNTVita PRIVATE guest)
+endif()
+
 target_link_libraries(TMNTVita PRIVATE
-    guest
     # vitaGL/vitashark reference SceShaccCgExt, which references taihen; GNU ld resolves left to right.
     vitaGL
     vitashark

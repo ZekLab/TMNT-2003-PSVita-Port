@@ -18,10 +18,24 @@
 #include "osdep.h"
 #include "runtime.h"
 #include "par.h"
+#ifdef __vita__
+#include "plat.h"
+#endif
 
 uint8_t *guest_membase;
 uint32_t g_guest_fs_base_cached;
 
+#ifdef TMNT_CODE_SO
+/* Vita: the translated code and its tables come from tmnt_code.so (code_so.c). */
+#include "code_so.h"
+#define guest_func_rvas (tmnt_code_mod->func_rvas)
+#define guest_func_ptrs (tmnt_code_mod->func_ptrs)
+#define guest_func_count (*tmnt_code_mod->func_count)
+#define guest_image_entry (*tmnt_code_mod->image_entry)
+#define guest_image_size (*tmnt_code_mod->image_size)
+#define guest_import_slots (tmnt_code_mod->import_slots)
+#define guest_import_count (*tmnt_code_mod->import_count)
+#else
 extern const uint32_t guest_func_rvas[];
 extern const guest_fn guest_func_ptrs[];
 extern const uint32_t guest_func_count;
@@ -31,6 +45,7 @@ extern const uint32_t guest_image_size;
 typedef struct { uint32_t slot_rva; const char *name; } guest_import_slot;
 extern const guest_import_slot guest_import_slots[];
 extern const uint32_t guest_import_count;
+#endif
 
 static pthread_mutex_t heap_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static int trace_imports;
@@ -719,12 +734,20 @@ static void load_image(const char *path)
     FILE *f = fopen(path, "rb");
     if (!f) {
         rt_log("[rt] cannot open %s\n", path);
+#ifdef __vita__
+        plat_fatal("The game image (image.bin) is missing from ux0:data/TMNT2003/.\n\n"
+                   "Make it on your computer from your copy of the game with tools/make_vita_files.py (see the README), then copy it there.");
+#endif
         exit(2);
     }
     size_t got = fread(guest_membase + GUEST_IMAGE_BASE, 1, guest_image_size, f);
     fclose(f);
     if (got != guest_image_size) {
         rt_log("[rt] short image %s: %zu of %u bytes\n", path, got, guest_image_size);
+#ifdef __vita__
+        plat_fatal("image.bin in ux0:data/TMNT2003/ is incomplete or does not match tmnt_code.so.\n\n"
+                   "Copy both files again from the same run of tools/make_vita_files.py.");
+#endif
         exit(2);
     }
     for (uint32_t i = 0; i < guest_import_count; i++) {
@@ -827,6 +850,9 @@ static int game_main(int argc, char **argv)
     }
     guest_membase = m;
     heap_init(GUEST_HEAP_LO, GUEST_SPACE);
+#ifdef TMNT_CODE_SO
+    code_so_load("tmnt_code.so");
+#endif
     load_image(image);
 
     static CPU cpu;
