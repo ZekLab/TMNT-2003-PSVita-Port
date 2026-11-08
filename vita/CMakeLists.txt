@@ -85,7 +85,7 @@ target_link_libraries(TMNTVita PRIVATE
 
 # ---- SELF + VPK ----
 set(VITA_TITLEID "TMNT02003")
-set(VITA_VERSION "00.01")
+set(VITA_VERSION "00.02")
 # ATTRIBUTE2=12: extended memory budget for the app.
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
@@ -97,7 +97,9 @@ if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png AND EXISTS ${CMAKE_CURR
         list(APPEND LIVEAREA_FILES FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/${file} sce_sys/${file})
     endforeach()
 else()
-    message(STATUS "No LiveArea images in vita/sce_sys; run tools/vita/livearea_from_art.py to add them")
+    # Public builds: the original text icon only (sce_sys_public), with the system's default LiveArea.
+    message(STATUS "No LiveArea images in vita/sce_sys; using the public icon (tools/vita/livearea_from_art.py makes the full set)")
+    list(APPEND LIVEAREA_FILES FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys_public/icon0.png sce_sys/icon0.png)
 endif()
 vita_create_vpk(TMNTVita.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
