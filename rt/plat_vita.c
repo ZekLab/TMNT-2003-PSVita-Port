@@ -16,6 +16,7 @@
 #include "movie.h"
 #include "plat.h"
 #include "runtime.h"
+#include "settings.h"
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -24,6 +25,7 @@ static int inited;
 static int game_w, game_h;   /* the size the game asked for; Win32 reports this one */
 static uint8_t dik[256];
 static SceCtrlData pad_now;
+static int input_blocked;   /* the settings menu has the pad */
 
 int plat_video_init(int width, int height)
 {
@@ -103,9 +105,24 @@ int plat_pump(void)
         rt_log("[plat] dump requested from the pad\n");
     }
     combo_held = held;
+    /* Select + Start opens the settings menu (rt/settings.c). While it is open, and until every button is let go after it closes,
+     * the game gets no input; the Start that opens it still pauses a level (not on the title screen, where it would start the game). */
+    static uint32_t prev;
+    uint32_t b = pad_now.buttons, down = b & ~prev, pressed = 0;
+    prev = b;
+    if (down & SCE_CTRL_UP) pressed |= SETTINGS_BTN_UP;
+    if (down & SCE_CTRL_DOWN) pressed |= SETTINGS_BTN_DOWN;
+    if (down & SCE_CTRL_LEFT) pressed |= SETTINGS_BTN_LEFT;
+    if (down & SCE_CTRL_RIGHT) pressed |= SETTINGS_BTN_RIGHT;
+    if (down & SCE_CTRL_CIRCLE) pressed |= SETTINGS_BTN_CLOSE;
+    if (down & SCE_CTRL_START) pressed |= SETTINGS_BTN_START;
+    int was_open = settings_open;
+    if (settings_input(pressed, (b & SCE_CTRL_SELECT) ? SETTINGS_BTN_SELECT : 0)) input_blocked = 1;
+    else if (input_blocked && !b) input_blocked = 0;
     /* Start: Enter on the title screen ("PRESS START" takes Enter, not Esc), elsewhere Esc, the game's pause key (the joystick has
      * no pause button). */
     int start = (pad_now.buttons & SCE_CTRL_START) != 0, title = start && tmnt_title_active();
+    if (input_blocked && (was_open || title)) start = title = 0;
     dik[0x1C] = title ? 0x80 : 0;
     dik[0x01] = start && !title ? 0x80 : 0;
 
@@ -133,7 +150,7 @@ void plat_pad(uint32_t *buttons, int32_t axes[4], int *pov)
 {
     static const uint32_t map[7] = { SCE_CTRL_CROSS, SCE_CTRL_CIRCLE, SCE_CTRL_SQUARE, SCE_CTRL_TRIANGLE,
                                      SCE_CTRL_LTRIGGER, SCE_CTRL_SELECT, SCE_CTRL_RTRIGGER };
-    uint32_t b = pad_now.buttons;
+    uint32_t b = input_blocked ? 0 : pad_now.buttons;
     const uint32_t lr = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
     int chord = (b & lr) == lr;
     if (chord) b &= ~lr;
@@ -142,10 +159,10 @@ void plat_pad(uint32_t *buttons, int32_t axes[4], int *pov)
         if (b & map[i])
             *buttons |= 1U << i;
     if (chord) *buttons |= 1U << 7;   /* L + R is button 8, the game's default special attack */
-    axes[0] = stick(pad_now.lx);
-    axes[1] = stick(pad_now.ly);
-    axes[2] = stick(pad_now.rx);
-    axes[3] = stick(pad_now.ry);
+    axes[0] = input_blocked ? 0 : stick(pad_now.lx);
+    axes[1] = input_blocked ? 0 : stick(pad_now.ly);
+    axes[2] = input_blocked ? 0 : stick(pad_now.rx);
+    axes[3] = input_blocked ? 0 : stick(pad_now.ry);
     *pov = -1;
     int up = !!(b & SCE_CTRL_UP), dn = !!(b & SCE_CTRL_DOWN), lf = !!(b & SCE_CTRL_LEFT), rt = !!(b & SCE_CTRL_RIGHT);
     if (up || dn || lf || rt) {

@@ -28,6 +28,7 @@ typedef struct rt_thunk {
     const char *name;
     uint32_t (*fn)(CPU *__restrict c);
     int nargs;
+    int serial;   /* Direct3D methods: one thread at a time while the draw pipeline runs (rt_call_thunk) */
 } rt_thunk;
 
 /* Argument n of a stdcall/cdecl call, read from the guest stack above the return address. */
@@ -45,6 +46,8 @@ void rt_safepoint(CPU *__restrict c, const rt_thunk *t);
 const rt_thunk *rt_current_thunk(CPU *__restrict c);
 uint32_t rt_current_tid(CPU *__restrict c);
 uint32_t rt_call_guest(CPU *__restrict c, uint32_t fn, int nargs, const uint32_t *args);
+/* A CPU with its own guest stack and TEB (win32.c), for guest work run by a host thread. */
+CPU *rt_new_thread_cpu(uint32_t stack);
 
 uint32_t rt_alloc(uint32_t n);
 void rt_free(uint32_t p);

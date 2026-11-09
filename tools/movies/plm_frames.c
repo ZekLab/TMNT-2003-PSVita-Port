@@ -8,6 +8,17 @@
 
 #include "plm_frames.h"
 
+#ifdef _WIN32
+#include <windows.h>
+/* movconv_win.c hands out UTF-8 paths; the Windows fopen would read them in the ANSI code page. */
+static FILE *open_utf8(const char *path)
+{
+    wchar_t w[1024];
+    return MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024) ? _wfopen(w, L"rb") : NULL;
+}
+#define fopen(path, mode) open_utf8(path)
+#endif
+
 struct pm_movie {
     plm_t *plm;
     int w, h;

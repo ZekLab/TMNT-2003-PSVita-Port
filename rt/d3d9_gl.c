@@ -15,6 +15,7 @@
 #include "osdep.h"
 #include "game_hooks.h"
 #include "overlay_font.h"
+#include "settings.h"
 
 /* GL state cache. The draw path re-specifies the whole fixed-function state for every D3D draw; vitaGL marks its pipeline dirty
  * (and re-selects a shader) on each such call even when nothing changed. Every simple state call in this file goes through these
@@ -1657,7 +1658,8 @@ static float ovl_text(float x, float y, float scale, const char *s, const float 
     return x;
 }
 
-static void draw_vita_overlay(uint32_t frame)
+/* GL state for 2D drawing over the finished frame, in framebuffer pixels (top left origin), the font texture bound. */
+static void ovl_begin(void)
 {
     if (!ovl_tex) {
         static uint8_t rgba[256 * 256 * 4];
@@ -1672,7 +1674,7 @@ static void draw_vita_overlay(uint32_t frame)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
-    float W = (float)map_fbw, H = (float)map_fbh, scale = H / 544.0f;
+    float W = (float)map_fbw, H = (float)map_fbh;
     glViewport(0, 0, map_fbw, map_fbh);
     glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_ALPHA_TEST); glDisable(GL_FOG); glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST); glDisable(GL_POLYGON_OFFSET_FILL);
@@ -1691,25 +1693,76 @@ static void draw_vita_overlay(uint32_t frame)
     for (int u = 1; u < 4; u++)
         if (tc_enabled[u]) { glClientActiveTexture(GL_TEXTURE0 + (GLenum)u); glDisableClientState(GL_TEXTURE_COORD_ARRAY); tc_enabled[u] = 0; }
     glClientActiveTexture(GL_TEXTURE0);
-
-    /* The game's "BUTTON n" labels (captured above) become the Vita buttons, at the label's place and height. */
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, ovl_tex);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+}
+
+static void ovl_end(void)
+{
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    tc_enabled[0] = 0;
+    glColor4f(1, 1, 1, 1);
+}
+
+static void draw_vita_overlay(uint32_t frame)
+{
+    ovl_begin();
+    /* The game's "BUTTON n" labels (captured above) become the Vita buttons, at the label's place and height. */
     static const float white[4] = { 1, 1, 1, 1 };
     static const char *names[9] = { "", "\1", "\2", "\3", "\4", "L", "SELECT", "R", "L + R" };
-    (void)scale;
     for (int n = 1; n <= 8; n++) {
         const float *box = ovl_box[n];
         if (ovl_box_frame[n] != frame || box[2] <= box[0]) continue;
         float h = box[3] - box[1], sc = h / (float)OVL_CELL_H * (n <= 4 ? 1.6f : 1.25f);   /* the symbols draw smaller than letters */
         ovl_text(box[0], box[1] - h * (n <= 4 ? 0.35f : 0.15f), sc, names[n], white);
     }
+    ovl_end();
+}
 
+/* The stage start screen on a cleared stage waits for an area choice (game_tmnt.c): a one-line hint at the bottom. */
+extern volatile int tmnt_stage_choice_hint;
+
+static void draw_stage_hint(void)
+{
+    ovl_begin();
+    float s = (float)map_fbh / 544.0f, w = 520 * s, h = 40 * s, x = ((float)map_fbw - w) / 2, y = (float)map_fbh - h - 14 * s;
+    glDisable(GL_TEXTURE_2D);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    tc_enabled[0] = 0;
-    glColor4f(1, 1, 1, 1);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.65f);
+    ovl_rounded_rect(x, y, w, h, 12 * s);
+    glEnable(GL_TEXTURE_2D);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    static const float white[4] = { 1, 1, 1, 1 };
+    ovl_text(x + 22 * s, y + 8 * s, 1.1f * s, "<  >  choose the area      \1  start", white);
+    ovl_end();
+}
+
+/* The settings menu (rt/settings.c, Select + Start): a translucent panel in the middle of the screen. */
+static void draw_settings_menu(void)
+{
+    ovl_begin();
+    float s = (float)map_fbh / 544.0f, pw = 620 * s, ph = (116 + 52 * SET_VISIBLE) * s, px = ((float)map_fbw - pw) / 2, py = ((float)map_fbh - ph) / 2;
+    glDisable(GL_TEXTURE_2D);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glColor4f(0.04f, 0.10f, 0.05f, 0.88f);
+    ovl_rounded_rect(px, py, pw, ph, 18 * s);
+    glColor4f(0.30f, 0.75f, 0.30f, 0.35f);
+    ovl_rounded_rect(px + 20 * s, py + 72 * s + (float)settings_cursor * 52 * s, pw - 40 * s, 44 * s, 10 * s);
+    glEnable(GL_TEXTURE_2D);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    static const float white[4] = { 1, 1, 1, 1 }, green[4] = { 0.55f, 0.95f, 0.45f, 1 }, grey[4] = { 0.75f, 0.80f, 0.75f, 1 };
+    ovl_text(px + 32 * s, py + 22 * s, 1.5f * s, "Settings", green);
+    for (int i = 0; i < SET_VISIBLE; i++) {
+        float y = py + 80 * s + (float)i * 52 * s;
+        ovl_text(px + 36 * s, y, 1.25f * s, settings_label(i), white);
+        char v[48];
+        snprintf(v, sizeof v, "< %s >%s", settings_value_text(i), settings_needs_restart(i) ? " *" : "");
+        ovl_text(px + 250 * s, y, 1.25f * s, v, white);
+    }
+    ovl_text(px + 32 * s, py + ph - 36 * s, 0.95f * s, "Up/Down choose   Left/Right change   \2 or START close", grey);
+    ovl_end();
 }
 
 /* The GL half of Present (the render thread in mode 1); the game thread counts the frame. */
@@ -1756,6 +1809,8 @@ static void exec_present(d3d_device *d, int overlay)
             }
     }
     if (overlay) draw_vita_overlay(d->frame);
+    if (tmnt_stage_choice_hint) draw_stage_hint();
+    if (settings_open) draw_settings_menu();
     if ((int)d->frame == shot_frame || (shot_every && d->frame % (uint32_t)shot_every == 0)) {
         char name[64];
         snprintf(name, sizeof name, "frame_%04u.png", d->frame);
@@ -2086,6 +2141,10 @@ static void rq_submit(void)
     arenas[rq_cur].used = 0;
 }
 
+/* Whether GL runs on the render thread: only then can Direct3D be called from another thread (the draw pipeline, game_tmnt.c). */
+int gl_render_threaded(void) { return gl_rq_mode == 1; }
+volatile int gl_present_no_pump;
+
 /* Called by gl_init_device once the device is set up (game thread). */
 static void rq_start(d3d_device *d)
 {
@@ -2166,7 +2225,9 @@ void gl_present(d3d_device *d)
             }
         }
     }
-    if (!plat_pump()) {
+    /* With the draw pipeline Present runs on the worker; the game thread pumps events itself (GetDeviceState, PeekMessage), and
+     * on the Mac only the main thread may. */
+    if (!gl_present_no_pump && !plat_pump()) {
         rt_log("[plat] quit requested\n");
         exit(0);
     }

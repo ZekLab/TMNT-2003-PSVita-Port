@@ -6,6 +6,7 @@
  * kept in TMNTCheckpoint.dat (next to SaveGame.dat); starting that stage from its first area jumps there, and clearing the
  * stage removes it. */
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -19,6 +20,10 @@
 #include "osdep.h"
 #include "runtime.h"
 #include "movie.h"
+#include "settings.h"
+#ifdef GUEST_CHECKED_MEMORY
+void memtrace_note_game_thread(void);
+#endif
 #include "par.h"
 
 #define AREA_TABLE 0x005e0560U
@@ -58,6 +63,70 @@ static void save_checkpoints(void)
     rename(CHECKPOINT_FILE ".tmp", CHECKPOINT_FILE);
 }
 
+/* Area select (settings menu "Start area"): a story stage started from its first area starts at the chosen area instead. Players
+ * see the areas they have reached (TMNTProgress.dat: the furthest area of each stage, every area of a cleared one); the build with
+ * the development menu (TMNT_DEV_MENU) lists every story area. */
+#define STORY_STAGES 6
+#define PROGRESS_FILE "TMNTProgress.dat"
+static int progress_max[MAX_STAGES], progress_cleared[MAX_STAGES], progress_loaded;
+static uint32_t choices[MAX_AREAS];
+static char choice_names[MAX_AREAS][40];
+static int choice_count;
+
+static void load_progress(void)
+{
+    progress_loaded = 1;
+    if (!loaded) load_checkpoints();
+    FILE *f = fopen(PROGRESS_FILE, "r");
+    int st, mx, cl;
+    while (f && fscanf(f, "%d %d %d", &st, &mx, &cl) == 3)
+        if (st > 0 && st < MAX_STAGES && mx >= 0 && (uint32_t)mx < MAX_AREAS) { progress_max[st] = mx; progress_cleared[st] = cl != 0; }
+    if (f) fclose(f);
+    for (int k = 1; k < MAX_STAGES; k++)   /* checkpoints from before this file existed */
+        if (checkpoint[k] > progress_max[k]) progress_max[k] = checkpoint[k];
+}
+
+static void save_progress(void)
+{
+    FILE *f = fopen(PROGRESS_FILE ".tmp", "w");
+    if (!f) return;
+    for (int k = 1; k < MAX_STAGES; k++)
+        if (progress_max[k] || progress_cleared[k]) fprintf(f, "%d %d %d\n", k, progress_max[k], progress_cleared[k]);
+    fclose(f);
+    rename(PROGRESS_FILE ".tmp", PROGRESS_FILE);
+}
+
+int tmnt_area_choice_count(void)
+{
+    if (!guest_membase) return 0;
+    if (!progress_loaded) load_progress();
+    choice_count = 0;
+    for (uint32_t i = 1; i < MAX_AREAS; i++) {
+        uint32_t st = area_stage(i);
+        if (st < 1 || st > STORY_STAGES) continue;
+#ifndef TMNT_DEV_MENU
+        if (!progress_cleared[st] && (int)i > progress_max[st]) continue;
+#endif
+        choices[choice_count] = i;
+        snprintf(choice_names[choice_count], sizeof choice_names[0], "%u-%u %s", st, area_number(i), area_name(i));
+        choice_count++;
+    }
+    return choice_count;
+}
+
+const char *tmnt_area_choice_name(int k) { return k >= 0 && k < choice_count ? choice_names[k] : "?"; }
+
+/* Where a stage started from its first area begins: the area chosen in the menu if it is in this stage, else its checkpoint. */
+static uint32_t stage_start_area(uint32_t stage)
+{
+    if (stage == 0 || stage >= MAX_STAGES || getenv("TMNT_NO_CHECKPOINTS")) return 0;
+    if (!loaded) load_checkpoints();
+    int k = settings_value(SET_START_AREA);
+    if (k > 0 && k <= tmnt_area_choice_count() && area_stage(choices[k - 1]) == stage) return choices[k - 1];
+    if (checkpoint[stage] && area_stage((uint32_t)checkpoint[stage]) == stage) return (uint32_t)checkpoint[stage];
+    return 0;
+}
+
 /* Highest area number of a stage in the table. */
 /* SetNextArea callers (RVAs of the return address) that classify the next StartArea. */
 #define FROM_STAGE_SELECT_A 0x0008c92dU
@@ -66,14 +135,25 @@ static void save_checkpoints(void)
 
 static uint32_t next_area_origin;
 
+static uint32_t stage_start_area(uint32_t stage);
+
 void tmnt_hook_set_next_area(CPU *c)
 {
     uint32_t from = ld32(c->esp);
     if (from == FROM_STAGE_SELECT_A || from == FROM_STAGE_SELECT_B || from == FROM_AREA_CLEARED)
         next_area_origin = from;
+    /* A stage started from the stage menu: its start screen already shows the area it will start at (chosen or checkpoint). */
+    uint32_t idx = ARG(0);
+    if ((from == FROM_STAGE_SELECT_A || from == FROM_STAGE_SELECT_B) && idx > 0 && idx < MAX_AREAS && area_number(idx) == 1) {
+        uint32_t start = stage_start_area(area_stage(idx));
+        if (start && start != idx) st32(c->esp + 4U, start);
+    }
 }
 
 /* StartArea(state, area index, ...) at 0x411d93: the area index is the second argument. */
+/* When the last area started (scripted test runs: plat_sdl.c TMNT_KEYS_AREA, rt/memtrace.c). */
+uint64_t tmnt_area_started_us;
+
 void tmnt_hook_start_area(CPU *c)
 {
     uint32_t origin = next_area_origin;
@@ -82,13 +162,28 @@ void tmnt_hook_start_area(CPU *c)
     if (idx == 0 || idx >= MAX_AREAS || getenv("TMNT_NO_CHECKPOINTS")) return;
     uint32_t stage = area_stage(idx), area = area_number(idx);
     rt_log("[checkpoint] StartArea(%u: stage %u area %u %s), origin %08x\n", idx, stage, area, area_name(idx), origin);
+    tmnt_area_started_us = rt_now_us();
     if (stage == 0 || stage >= MAX_STAGES || origin == 0) return;
     if (!loaded) load_checkpoints();
 
+    if (!progress_loaded) load_progress();
+    if (origin != FROM_AREA_CLEARED && area != 1) {   /* the start area was already applied at SetNextArea */
+        int k = settings_value(SET_START_AREA);
+        if (k > 0 && k <= choice_count && choices[k - 1] == idx) {
+            rt_log("[checkpoint] stage %u: starting at the chosen area %u (%s)\n", stage, area, area_name(idx));
+            settings_set(SET_START_AREA, 0);
+        } else {
+            rt_log("[checkpoint] stage %u: starting at area %u (%s)\n", stage, area, area_name(idx));
+        }
+    }
     if (origin == FROM_AREA_CLEARED) {
         /* Clearing the stage's last area ends the stage: the next StartArea is another stage or a menu area. */
         if (last_index > 0) {
             uint32_t ls = area_stage((uint32_t)last_index);
+            if (ls != stage && ls < MAX_STAGES && !progress_cleared[ls]) {
+                progress_cleared[ls] = 1;
+                save_progress();
+            }
             if (ls != stage && ls < MAX_STAGES && checkpoint[ls]) {
                 rt_log("[checkpoint] stage %u cleared, checkpoint removed\n", ls);
                 checkpoint[ls] = 0;
@@ -100,6 +195,15 @@ void tmnt_hook_start_area(CPU *c)
             save_checkpoints();
             rt_log("[checkpoint] stage %u: area %u (%s) saved\n", stage, area, area_name(idx));
         }
+    } else if (area == 1 && settings_value(SET_START_AREA) > 0 && settings_value(SET_START_AREA) <= tmnt_area_choice_count() &&
+               area_stage(choices[settings_value(SET_START_AREA) - 1]) == stage) {
+        uint32_t pick = choices[settings_value(SET_START_AREA) - 1];
+        rt_log("[checkpoint] stage %u: starting at the chosen area %u (%s)\n", stage, area_number(pick), area_name(pick));
+        settings_set(SET_START_AREA, 0);   /* once: the next start of a stage uses its checkpoint again */
+        st32(c->esp + 8, pick);
+        uint32_t gs = ld32(GAME_STATE_PTR);
+        if (gs) st32(gs + NEXT_AREA_FIELD, pick);
+        idx = pick;
     } else if (area == 1 && checkpoint[stage] && area_stage((uint32_t)checkpoint[stage]) == stage) {
         uint32_t resume = (uint32_t)checkpoint[stage];
         rt_log("[checkpoint] stage %u: resuming at area %u (%s)\n", stage, area_number(resume), area_name(resume));
@@ -107,6 +211,10 @@ void tmnt_hook_start_area(CPU *c)
         uint32_t gs = ld32(GAME_STATE_PTR);
         if (gs) st32(gs + NEXT_AREA_FIELD, resume);
         idx = resume;
+    }
+    if (stage <= STORY_STAGES && (int)idx > progress_max[stage]) {
+        progress_max[stage] = (int)idx;
+        save_progress();
     }
     last_index = (int)idx;
 }
@@ -151,11 +259,21 @@ int tmnt_fast_getptd(CPU *c)
 #define TICKS_BASE 0x0069f848U
 #define RDTSC_READER 0x004b33a9U
 
+static CPU *pipe_cpu;   /* the draw worker of the pipeline (below), NULL until it starts */
+static volatile uint64_t pipe_present_us;   /* when the worker entered the present/pacing function 0x4b000b */
+
 int tmnt_fast_ticks(CPU *c)
 {
     if (ld32(TICKS_CLOCK_FN) != RDTSC_READER) return 0;
     uint64_t base = (uint64_t)ld32(TICKS_BASE) | ((uint64_t)ld32(TICKS_BASE + 4U) << 32);
     uint64_t t = guest_rdtsc() - base;
+    if (pipe_cpu && c == pipe_cpu && pipe_present_us && getenv("TMNT_PIPE_DEBUG")) {   /* a pacing wait on the worker that never ends */
+        static uint64_t logged_for;
+        if (rt_now_us() - pipe_present_us > 1000000U && logged_for != pipe_present_us && (logged_for = pipe_present_us))
+            rt_log("[pipe] long wait: ticks %llu, deadline %08x%08x, cycle start %08x%08x, index %u, level %u, frames %u, flag %u\n",
+                   (unsigned long long)t, ld32(0x0069f544U), ld32(0x0069f540U), ld32(0x0069f54cU), ld32(0x0069f548U), ld32(0x0069f558U),
+                   ld32(0x0069f554U), ld32(0x0069f550U), ld32(0x005f43b0U));
+    }
     c->eax = (uint32_t)t;
     c->edx = (uint32_t)(t >> 32);
     c->esp += 4U;   /* the function's `ret` */
@@ -226,6 +344,9 @@ void tmnt_hook_logic(CPU *c)
 {
     uint64_t now;
     (void)c;
+#ifdef GUEST_CHECKED_MEMORY
+    memtrace_note_game_thread();
+#endif
     if (!perf_begin(&now)) return;
     if (perf_phase == 3) perf_other += now - perf_t;
     if (!perf_window_t) perf_window_t = now;
@@ -267,7 +388,7 @@ void tmnt_hook_draw(CPU *c)
 void tmnt_hook_present(CPU *c)
 {
     uint64_t now;
-    (void)c;
+    if (pipe_cpu && c == pipe_cpu) pipe_present_us = rt_now_us();
     if (!perf_begin(&now) || perf_phase != 2) return;
     perf_draw += now - perf_t;
     perf_phase = 3;
@@ -280,17 +401,384 @@ void tmnt_hook_skip_check(CPU *c)
     uint64_t now;
     (void)c;
     if (!perf_begin(&now)) return;
-    if (perf_phase == 2) {
+    if (perf_phase == 2 || (pipe_cpu && c == pipe_cpu)) {   /* with the pipeline the worker draws whatever phase the game thread is in */
         if (perf_checked++) return;
         if (cap_on == 2 || (cap_on && cap_heavy)) {
             uint32_t level = ld32(SKIP_LEVEL);
-            if (level < CAP_LEVEL || (fps_lock && level > CAP_LEVEL)) st32(SKIP_LEVEL, CAP_LEVEL);
+            if (level < CAP_LEVEL || (settings_value(SET_FPS_LOCK) && level > CAP_LEVEL)) st32(SKIP_LEVEL, CAP_LEVEL);
         }
         if (!ld32(SKIP_TABLE + 4U * (ld32(SKIP_LEVEL) * 12U + ld32(SKIP_INDEX)))) perf_drawn++;
     } else if (perf_phase == 3) {
         perf_wait += now - perf_t;
         perf_t = now;
     }
+}
+
+/* Draw/logic pipeline (experimental; settings menu "Pipeline", TMNT_PIPELINE=1). The game's tick 0x4ac4db is: swap the two task
+ * queues, logic 0x4aca5f, draw 0x4ac384 (render, Present and the tick's busy wait), then 0x4ac229 applies the queue the logic filled
+ * (task commands). With the pipeline the logic of tick t runs on the game thread while a worker thread draws tick t-1; the
+ * queue of t-1 is applied around that logic (pipe_queue_fields), so nothing the draw still uses is removed under it. The current-task globals are per thread (gen_c.py PER_THREAD_GLOBALS)
+ * and Direct3D calls take a lock (runtime.c). Found with the memtrace build (rt/memtrace.c); state the logic changes while the
+ * previous tick is drawn can still show for a frame. */
+#define FRAME_QUEUE_CUR 0x00645fccU
+#define FRAME_QUEUE_PREV 0x00645fc8U
+#define FRAME_QUEUE_COUNT 0x600U
+#define FN_TICK_LOGIC 0x004aca5fU
+#define FN_TICK_DRAW 0x004ac384U
+#define FN_TICK_QUEUE 0x004ac229U
+#define PT_GLOBALS 0x00646d2cU
+
+static rt_cond pipe_cv;
+static volatile int pipe_job, pipe_done = 1;
+static uint32_t pipe_queue;
+static uint32_t deferred_count;   /* calls queued while the worker draws (pipe_defer, below) */
+static void pipe_run_deferred(CPU *c);
+static uint64_t pipe_logic_us, pipe_draw_us, pipe_wait_us, pipe_report_us;
+static uint32_t pipe_ticks;
+
+static void *pipe_main(void *arg)
+{
+    (void)arg;
+    rt_thread_place_self(0, 0);
+    plat_thread_label("draw");
+    for (;;) {
+        rt_cond_lock(&pipe_cv);
+        while (!pipe_job) rt_cond_wait_ms(&pipe_cv, 0xFFFFFFFFU);
+        pipe_job = 0;
+        rt_cond_unlock(&pipe_cv);
+        uint64_t t0 = rt_now_us();
+        rt_call_guest(pipe_cpu, FN_TICK_DRAW, 0, NULL);
+        pipe_draw_us += rt_now_us() - t0;
+        rt_cond_lock(&pipe_cv);
+        pipe_done = 1;
+        rt_cond_broadcast(&pipe_cv);
+        rt_cond_unlock(&pipe_cv);
+    }
+    return NULL;
+}
+
+static int pipe_start(void)
+{
+    rt_cond_init(&pipe_cv);
+    CPU *w = rt_new_thread_cpu(1U << 20);
+    uint32_t copy = rt_alloc(16U);
+    if (!w || !copy) return 0;
+    memcpy(G2H(copy), G2H(PT_GLOBALS), 8);
+    guest_pt_shift = copy - PT_GLOBALS;
+    pipe_cpu = w;
+    pthread_attr_t a;
+    pthread_t t;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 4U << 20);   /* translated code keeps every guest call on the native stack */
+    int r = pthread_create(&t, &a, pipe_main, NULL);
+    pthread_attr_destroy(&a);
+    if (r) { pipe_cpu = NULL; rt_log("[pipe] could not start the draw worker (%d)\n", r); return 0; }
+    pthread_detach(t);
+    extern volatile int gl_present_no_pump;
+    gl_present_no_pump = 1;
+    guest_pt_cpu = w;
+    rt_log("[pipe] draw worker started\n");
+    return 1;
+}
+
+#define FN_TASK_VALID 0x004ac958U
+
+/* The task queue holds commands (task, op, value): 0 remove, 1 and 2 clear/set flag bits of +8, 3 and 4 state +0x10 = 4 or 3,
+ * 5 relink at another priority, 6 update function +0x1c, 7 draw function +0x20 (0x4ac229). Before the logic of tick t, while the
+ * worker still draws t-1, the commands that only set a field are applied, as the game would before this logic (a task moving to
+ * its next step must not run the old one again: that left the stage load on a black screen). A task to remove is parked in state
+ * 3, which the logic loop skips; the removals and relinks touch the lists the draw walks, so they wait for the draw. */
+static void pipe_queue_fields(CPU *c, uint32_t q)
+{
+    uint32_t n = ld32(q + FRAME_QUEUE_COUNT);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t e = q + 12U * i, task = ld32(e), op = ld32(e + 4U), val = ld32(e + 8U);
+        if (!task || op > 7U || op == 5U) continue;
+        if (!rt_call_guest(c, FN_TASK_VALID, 1, &task)) continue;
+        switch (op) {
+        case 0: st32(task + 0x10U, 3U); continue;   /* the entry stays: removed after the draw */
+        case 1: st32(task + 8U, val ? ld32(task + 8U) & ~1U : ld32(task + 8U) | 1U); break;
+        case 2: st32(task + 8U, val ? ld32(task + 8U) & ~2U : ld32(task + 8U) | 2U); break;
+        case 3: st32(task + 0x10U, 4U); break;
+        case 4: st32(task + 0x10U, 3U); break;
+        case 6: st32(task + 0x1cU, val); break;
+        case 7: st32(task + 0x20U, val); break;
+        }
+        st32(e, 0);   /* done: the game's own pass after the draw skips an entry without a task */
+    }
+}
+
+/* Waits for the worker's draw, then applies that tick's task queue here on the game thread. */
+static void pipe_wait(CPU *c)
+{
+    uint64_t t0 = rt_now_us();
+    rt_cond_lock(&pipe_cv);
+    while (!pipe_done) rt_cond_wait_ms(&pipe_cv, 0xFFFFFFFFU);
+    rt_cond_unlock(&pipe_cv);
+    pipe_wait_us += rt_now_us() - t0;
+    if (pipe_queue) {
+        uint32_t q = pipe_queue;
+        pipe_queue = 0;
+        rt_call_guest(c, FN_TICK_QUEUE, 1, &q);
+    }
+    if (deferred_count) pipe_run_deferred(c);   /* after the queue: in the game's order it came first */
+}
+
+/* Draw lists. Each view keeps its tasks in lists the draw walks (0x4acaa4, 0x4acab0 -> loop 0x4ac90a: skip state 3, call the draw
+ * function +0x20 unless flag 2, then write state 2). With the pipeline the worker walks them while the logic of the next tick
+ * runs, so (1) the worker writes state 2 only if the logic has not changed the state meanwhile, and (2) whatever the logic does
+ * to the lists or to a task's memory while the worker draws (insert 0x4ac6b6, remove 0x4ac6e2, view slot 0x4ac70b, free 0x4ac8a7,
+ * destroy 0x4ac1d1) is queued and done right after that draw, in order. */
+static void draw_task_list(CPU *c, uint32_t node)
+{
+    const uint32_t cur = GUEST_PT(c, PT_GLOBALS);
+    const int worker = pipe_cpu && c == pipe_cpu;
+    for (; node; node = ld32(node + 8U)) {
+        uint32_t task = ld32(node), s0 = ld32(task + 0x10U);
+        if (s0 == 3U) continue;
+        uint32_t fn = ld32(task + 0x20U);
+        if (fn && !(ld8(task + 8U) & 2U)) {
+            st32(cur, task);
+            st32(cur + 4U, task);
+            uint32_t arg = ld32(task + 0x34U);
+            rt_call_guest(c, fn, 1, &arg);
+        }
+        st32(cur, 0);
+        st32(cur + 4U, 0);
+        if (worker) __atomic_compare_exchange_n((uint32_t *)G2H(task + 0x10U), &s0, 2U, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        else st32(task + 0x10U, 2U);
+    }
+}
+
+/* Only once the pipeline has started; until then the game's own loop runs. */
+int tmnt_fast_draw_tasks_a(CPU *c) { if (!pipe_cpu) return 0; draw_task_list(c, ld32(ARG(0) + 0x10U)); c->esp += 4U; return 1; }
+int tmnt_fast_draw_tasks_b(CPU *c) { if (!pipe_cpu) return 0; draw_task_list(c, ld32(ARG(0) + 0x24U)); c->esp += 4U; return 1; }
+
+typedef struct { uint32_t fn, esi, nargs, args[3]; } deferred_call;
+#define MAX_DEFERRED 4096U
+static deferred_call deferred[MAX_DEFERRED];
+
+/* Queues the call being made (fn with nargs stack arguments, esi kept for 0x4ac1d1) when the worker is drawing; 1 = queued. */
+static int pipe_defer(CPU *c, uint32_t fn, uint32_t nargs)
+{
+    if (!pipe_cpu || c == pipe_cpu || pipe_done) return 0;
+    if (deferred_count >= MAX_DEFERRED) {
+        rt_log("[pipe] deferred-call queue full, %08x runs now\n", fn);
+        return 0;
+    }
+    deferred_call *d = &deferred[deferred_count++];
+    d->fn = fn;
+    d->esi = c->esi;
+    d->nargs = nargs;
+    for (uint32_t i = 0; i < nargs; i++) d->args[i] = ARG(i);
+    c->esp += 4U;
+    return 1;
+}
+
+static void pipe_run_deferred(CPU *c)
+{
+    uint32_t keep = c->esi;
+    for (uint32_t i = 0; i < deferred_count; i++) {
+        c->esi = deferred[i].esi;
+        rt_call_guest(c, deferred[i].fn, (int)deferred[i].nargs, deferred[i].args);
+    }
+    c->esi = keep;
+    deferred_count = 0;
+}
+
+int tmnt_fast_list_insert(CPU *c) { return pipe_defer(c, 0x004ac6b6U, 3); }
+int tmnt_fast_list_remove(CPU *c) { return pipe_defer(c, 0x004ac6e2U, 3); }
+int tmnt_fast_list_slot(CPU *c) { return pipe_defer(c, 0x004ac70bU, 3); }
+int tmnt_fast_task_free(CPU *c) { return pipe_defer(c, 0x004ac8a7U, 1); }
+int tmnt_fast_task_destroy(CPU *c)
+{
+    uint32_t task = c->esi;
+    if (!pipe_defer(c, 0x004ac1d1U, 0)) return 0;
+    st32(task + 0x10U, 3U);   /* both task loops skip it until it is destroyed */
+    return 1;
+}
+
+/* TMNT_TRACE_TASKS=1 (development): each task the game creates (0x4ac135(descriptor, arg)) with its init, update and draw
+ * functions, to find the task behind a screen. */
+int tmnt_fast_task_create(CPU *c)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TMNT_TRACE_TASKS") && atoi(getenv("TMNT_TRACE_TASKS"));
+    if (on) {
+        uint32_t d = ARG(0);
+        rt_log("[task] create from %08x: descriptor %08x, init %08x, update %08x, draw %08x, destroy %08x, arg %08x\n", ld32(c->esp),
+               d, ld32(d + 0x10U), ld32(d + 0x18U), ld32(d + 0x1cU), ld32(d + 0x14U), ARG(1));
+    }
+    return 0;
+}
+
+/* The stage start screen (task update 0x4a0371; its state machine at [[0x61cea4]+0]): the stage's areas side by side, the turtle
+ * walking to the area it starts at (state 7: the game moves on when the walk ends or Decide is pressed). On a stage already
+ * cleared (stage_cleared; every stage in builds with the development menu) the screen waits in state 7 instead: Left and Right
+ * pick another area of the stage (the next area +0x13c of the game state, then the screen's own destroy and init rebuild it there)
+ * and Decide starts it. Training areas (DOUJYOU) are left out. */
+#define STAGE_SCREEN_PTR 0x0061cea4U
+#define AREA_SLOT_TABLE 0x0059a210U
+#define DIK_LEFT 0xCBU
+#define DIK_RIGHT 0xCDU
+
+volatile int tmnt_stage_choice_hint;   /* d3d9_gl.c draws the hint while the screen waits */
+
+/* A stage is cleared once its last area (training ones aside) has a time in the game's progress: its own record, reached at the
+ * screen with the times. The progress lives at [0x60eae4] (SaveGame.dat from byte 8): per area 0x48 bytes from 0x228, the time
+ * first (10000 = none). TMNTProgress.dat counts too. */
+#define SAVE_PTR 0x0060eae4U
+#define SAVE_AREA_TIMES 0x228U
+#define SAVE_AREA_SIZE 0x48U
+#define NO_TIME 10000U
+static int stage_cleared(uint32_t stage)
+{
+    if (stage < 1 || stage > STORY_STAGES) return 0;
+    if (!progress_loaded) load_progress();
+    if (progress_cleared[stage]) return 1;
+    uint32_t save = ld32(SAVE_PTR), last = 0;
+    if (!save) return 0;
+    for (uint32_t i = 1; i < MAX_AREAS; i++)
+        if (area_stage(i) == stage && strncmp(area_name(i), "DOUJYOU", 7) != 0) last = i;
+    return last && ld32(save + SAVE_AREA_TIMES + last * SAVE_AREA_SIZE) != NO_TIME;
+}
+
+static int stage_choosable(uint32_t stage)
+{
+    if (stage < 1 || stage > STORY_STAGES) return 0;
+#ifdef TMNT_DEV_MENU
+    return 1;
+#else
+    return stage_cleared(stage);
+#endif
+}
+
+/* The area panels (0x599fe0, 35 rows of 16 bytes: stage - 1, colour and grey file ids, colour and grey texture names): the screen draws the areas after
+ * the current one grey. Archive 3's files are opened by id (0x52f4f0(archive, id)); a cleared stage's grey panels load their
+ * colour file and texture name instead (the ids stay apart: the screen also loads the next area's colour panel), so every area of
+ * it is drawn in colour. */
+#define AREA_PANEL_TABLE 0x00599fe0U
+#define AREA_PANELS 35U
+#define GREY_PANEL_FIRST 0x2adU
+void tmnt_hook_open_resource(CPU *c)
+{
+    uint32_t id = ARG(1);
+    if (ARG(0) != 3U || id < GREY_PANEL_FIRST || id >= GREY_PANEL_FIRST + AREA_PANELS) return;
+    uint32_t row = AREA_PANEL_TABLE + (id - GREY_PANEL_FIRST) * 16U, stage = ld32(row) + 1U;
+    if (ld16(row + 6U) != id) return;
+    if (stage_cleared(stage)) {
+        st32(c->esp + 8U, ld16(row + 4U));
+        st32(row + 12U, ld32(row + 8U));   /* the texture's name in it too ("map_ar1_5", not "map_ar1_5m") */
+    }
+}
+
+/* The next or previous playable area of the same stage, or 0. */
+static uint32_t stage_neighbour(uint32_t idx, int step)
+{
+    uint32_t stage = area_stage(idx);
+    for (int i = (int)idx + step; i > 0 && i < (int)MAX_AREAS; i += step) {
+        if (area_stage((uint32_t)i) != stage) return 0;
+        if (strncmp(area_name((uint32_t)i), "DOUJYOU", 7) != 0) return (uint32_t)i;
+    }
+    return 0;
+}
+
+int tmnt_fast_stage_screen(CPU *c)
+{
+    static int trace = -1, in_body, confirmed;
+    static uint32_t last_state = 0xffffffffU, prev_buttons, prev_left, prev_right;
+    if (in_body) return 0;
+    if (trace < 0) trace = getenv("TMNT_TRACE_TASKS") && atoi(getenv("TMNT_TRACE_TASKS"));
+    uint32_t scr = ld32(STAGE_SCREEN_PTR), gs = ld32(GAME_STATE_PTR);
+    if (!scr || !gs) return 0;
+    uint32_t state = ld32(scr), next = ld32(gs + NEXT_AREA_FIELD);
+    if (trace && state != last_state)
+        rt_log("[stage screen] state %u, slot %u, next area %u, stage cleared %d\n", state, ld32(scr + 0x14U), next,
+               stage_cleared(area_stage(next)));
+    last_state = state;
+    if (state < 3) confirmed = 0;
+    if (state != 7 || confirmed || next == 0 || next >= MAX_AREAS || !stage_choosable(area_stage(next))) {
+        tmnt_stage_choice_hint = 0;
+        return 0;
+    }
+
+    /* Waiting in state 7: the pad's D-pad or stick and the keyboard's arrows pick, Decide (button 1, Enter or F) confirms. */
+    uint32_t buttons = 0;
+    int32_t axes[4] = { 0, 0, 0, 0 };
+    int pov = -1;
+    plat_pad(&buttons, axes, &pov);
+    const uint8_t *k = plat_dik_state();
+    int left = k[DIK_LEFT] || pov == 27000 || axes[0] < -600, right = k[DIK_RIGHT] || pov == 9000 || axes[0] > 600;
+    int decide = (buttons & 1U) || k[0x1C] || k[0x21];
+    int step = (left && !prev_left) ? -1 : (right && !prev_right) ? 1 : 0;
+    int pressed = decide && !(prev_buttons & 1U);
+    prev_left = (uint32_t)left;
+    prev_right = (uint32_t)right;
+    prev_buttons = decide ? 1U : 0U;
+    tmnt_stage_choice_hint = 1;
+    if (pressed) {
+        confirmed = 1;
+        tmnt_stage_choice_hint = 0;
+        rt_log("[stage screen] area %u (%s) chosen\n", area_number(next), area_name(next));
+        return 0;   /* the game's own Decide path moves on */
+    }
+    if (step) {
+        uint32_t to = stage_neighbour(next, step);
+        if (to) {
+            st32(gs + NEXT_AREA_FIELD, to);
+            /* The screen is rebuilt the way the task system does it: its destroy, then its init (which reads the next area). */
+            const uint32_t init_args[2] = { scr, 0U };   /* init(data, param): no param = the next area */
+            rt_call_guest(c, 0x0049f040U, 0, NULL);
+            rt_call_guest(c, 0x0049f653U, 2, init_args);
+        }
+    }
+    /* Run the screen (the walk, the panels) but keep it in state 7 once the walk has ended. */
+    in_body = 1;
+    rt_call_guest(c, 0x004a0371U, 0, NULL);
+    in_body = 0;
+    if (ld32(scr) == 8U && !confirmed) st32(scr, 7U);
+    c->esp += 4U;   /* the function's `ret` */
+    return 1;
+}
+
+int tmnt_fast_frame(CPU *c)
+{
+    if (c == pipe_cpu) return 0;
+    if (!settings_value(SET_PIPELINE)) {
+        if (pipe_cpu && (!pipe_done || pipe_queue)) pipe_wait(c);   /* turned off: finish the tick in flight first */
+        return 0;
+    }
+    extern int gl_render_threaded(void);
+    if (!gl_render_threaded()) return 0;   /* GL on the game thread (Mac default): Direct3D cannot move to the worker */
+    if (!pipe_cpu && !pipe_start()) return 0;
+    uint32_t cur = ld32(FRAME_QUEUE_CUR), prev = ld32(FRAME_QUEUE_PREV);
+    st32(FRAME_QUEUE_CUR, prev);
+    st32(FRAME_QUEUE_PREV, cur);
+    st32(prev + FRAME_QUEUE_COUNT, 0);
+    if (pipe_queue) pipe_queue_fields(c, pipe_queue);
+    uint64_t t0 = rt_now_us();
+    rt_call_guest(c, FN_TICK_LOGIC, 0, NULL);
+    pipe_logic_us += rt_now_us() - t0;
+    pipe_wait(c);
+    pipe_queue = ld32(FRAME_QUEUE_CUR);
+    rt_cond_lock(&pipe_cv);
+    pipe_done = 0;
+    pipe_job = 1;
+    rt_cond_broadcast(&pipe_cv);
+    rt_cond_unlock(&pipe_cv);
+    pipe_ticks++;
+    uint64_t now = rt_now_us();
+    if (!pipe_report_us) pipe_report_us = now;
+    if (now - pipe_report_us >= 2000000U && perf_on > 0) {
+        double t = pipe_ticks;
+        rt_log("[pipe] %u ticks: logic %.1f ms/tick on the game thread, draw %.1f ms/tick on the worker, game thread waited %.1f ms/tick\n",
+               pipe_ticks, pipe_logic_us / t / 1000.0, pipe_draw_us / t / 1000.0, pipe_wait_us / t / 1000.0);
+        pipe_logic_us = pipe_draw_us = pipe_wait_us = 0;
+        pipe_ticks = 0;
+        pipe_report_us = now;
+    }
+    c->esp += 4U;   /* the function's `ret` */
+    return 1;
 }
 
 /* RpSkin generic x87 skinning in native float. 0x4f52f0 (up to 4 bones) and 0x4f5960 (2 bones) take (count, weights, indices,

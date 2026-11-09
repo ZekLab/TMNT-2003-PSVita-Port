@@ -1,0 +1,98 @@
+# The Vita files builder for Windows and Mac (tools/builder): built on every v* tag and attached to its release, or by hand
+# (Actions -> builder -> Run workflow) as downloadable artifacts. Zig (clang + lld) is bundled at a fixed version and checksum.
+name: builder
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.14.1"
+  PYINSTALLER_VERSION: "6.11.1"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            zig: x86_64-windows
+            zig_sha256: 554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c
+            asset: TMNT2003-Vita-Builder-Windows.zip
+          - os: macos-14
+            zig: aarch64-macos
+            zig_sha256: 39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa
+            asset: TMNT2003-Vita-Builder-Mac-AppleSilicon.zip
+          - os: macos-13
+            zig: x86_64-macos
+            zig_sha256: b0f8bdfb9035783db58dd6c19d7dea89892acc3814421853e5752fe4573e5f43
+            asset: TMNT2003-Vita-Builder-Mac-Intel.zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: python -m pip install "pyinstaller==${PYINSTALLER_VERSION}" -r tools/vita_code/requirements.txt
+      - name: Zig (checksum from ziglang.org/download/index.json)
+        run: |
+          ext=$([ "${{ matrix.os }}" = windows-latest ] && echo zip || echo tar.xz)
+          name="zig-${{ matrix.zig }}-${ZIG_VERSION}"
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/${name}.${ext}" -o "zig.${ext}"
+          echo "${{ matrix.zig_sha256 }}  zig.${ext}" | shasum -a 256 -c
+          if [ "$ext" = zip ]; then unzip -q zig.zip; else tar xf zig.tar.xz; fi
+          mkdir -p zigmin/lib
+          cp "$name"/zig* "$name/LICENSE" zigmin/
+          cp -R "$name/lib/include" zigmin/lib/
+          echo "ZIG_DIR=$PWD/zigmin" >> "$GITHUB_ENV"
+      - name: Movie converter (Mac, VideoToolbox)
+        if: runner.os == 'macOS'
+        run: |
+          arch=$([ "${{ matrix.zig }}" = aarch64-macos ] && echo arm64 || echo x86_64)
+          mkdir -p movconv_build
+          clang -O2 -arch "$arch" -mmacosx-version-min=11.0 -c tools/movies/plm_frames.c -o movconv_build/plm_frames.o
+          swiftc -O -swift-version 5 -target "$arch-apple-macos11" -import-objc-header tools/movies/plm_frames.h \
+            tools/movies/movconv.swift movconv_build/plm_frames.o -o movconv_build/movconv
+          echo "MOVCONV=$PWD/movconv_build/movconv" >> "$GITHUB_ENV"
+      - name: Movie converter (Windows, Media Foundation)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p movconv_build
+          "zig-${{ matrix.zig }}-${ZIG_VERSION}/zig.exe" cc -target x86_64-windows-gnu -O2 tools/movies/movconv_win.c \
+            tools/movies/plm_frames.c -lmfplat -lmfuuid -lole32 -lshell32 -loleaut32 -o movconv_build/movconv.exe
+          echo "MOVCONV=$PWD/movconv_build/movconv.exe" >> "$GITHUB_ENV"
+      - name: Movie converter self-test (synthetic frames through this Windows' encoder and decoder)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: movconv_build/movconv.exe --self-test movconv_build/self_test
+      - name: PyInstaller
+        run: pyinstaller --noconfirm tools/builder/tmnt_builder.spec
+      - name: Package
+        run: |
+          mkdir -p upload
+          if [ "${{ matrix.os }}" = windows-latest ]; then
+            cp dist/TMNT2003-Vita-Builder.exe upload/
+            (cd upload && 7z a "../${{ matrix.asset }}" TMNT2003-Vita-Builder.exe)
+          else
+            ditto -c -k --keepParent "dist/TMNT2003 Vita Builder.app" "${{ matrix.asset }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --notes ""
+          gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" --clobber

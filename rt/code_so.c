@@ -37,17 +37,22 @@ EABI_HELPERS(EABI_DECL)
     X(fmod) X(ldexp) X(frexp) X(log) X(log2) X(log10) X(exp) X(exp2) X(pow) \
     X(sinf) X(cosf) X(atan2f) X(sqrtf) X(fabsf) X(truncf) X(floorf) X(ceilf) X(roundf) X(fmodf) \
     X(guest_membase) X(guest_trace_on) X(guest_call) X(guest_cpuid) X(guest_fault) X(guest_fs_base) X(guest_int3) X(guest_rdtsc) \
-    X(guest_trace_enter) \
-    X(tmnt_fast_anim_curve) X(tmnt_fast_getptd) X(tmnt_fast_hanim_attach) X(tmnt_fast_rw_flush_states) X(tmnt_fast_rw_invsqrt) \
+    X(guest_trace_enter) X(guest_prof_cpu) X(guest_prof_fn) X(guest_pt_cpu) X(guest_pt_shift) \
+    X(tmnt_fast_anim_curve) X(tmnt_fast_frame) X(tmnt_fast_task_create) X(tmnt_fast_stage_screen) X(tmnt_fast_draw_tasks_a) X(tmnt_fast_draw_tasks_b) X(tmnt_fast_list_insert) \
+    X(tmnt_fast_list_remove) X(tmnt_fast_list_slot) X(tmnt_fast_task_free) X(tmnt_fast_task_destroy) X(tmnt_fast_getptd) X(tmnt_fast_hanim_attach) X(tmnt_fast_rw_flush_states) X(tmnt_fast_rw_invsqrt) \
     X(tmnt_fast_rw_matrix_multiply) X(tmnt_fast_rw_v3d_length) X(tmnt_fast_rw_xform_point) X(tmnt_fast_rw_xform_points) \
     X(tmnt_fast_sfd_skip) X(tmnt_fast_sfd_yuv_argb) X(tmnt_fast_skin1) X(tmnt_fast_skin2) X(tmnt_fast_skin4) X(tmnt_fast_sphere_tri) \
     X(tmnt_fast_ticks) X(tmnt_fast_toon_ink_quad) X(tmnt_fast_toon_ink_vertex) \
-    X(tmnt_hook_draw) X(tmnt_hook_logic) X(tmnt_hook_pad_settings) X(tmnt_hook_present) X(tmnt_hook_set_next_area) \
+    X(tmnt_hook_draw) X(tmnt_hook_logic) X(tmnt_hook_pad_settings) X(tmnt_hook_present) X(tmnt_hook_set_next_area) X(tmnt_hook_open_resource) \
     X(tmnt_hook_sfd_frame) X(tmnt_hook_skip_check) X(tmnt_hook_start_area) X(tmnt_hook_title) \
     X(tmnt_region_pad_label) X(tmnt_region_pad_label_check) X(tmnt_region_toon_cam_vectors) X(tmnt_region_toon_cam_vectors_check) \
     X(tmnt_region_toon_copy_nrm) X(tmnt_region_toon_copy_nrm_check) X(tmnt_region_toon_copy_pos) X(tmnt_region_toon_copy_pos_check) \
     X(tmnt_region_toon_edges) X(tmnt_region_toon_edges_check) X(tmnt_region_toon_face_normals) \
     X(tmnt_region_toon_face_normals_check) X(tmnt_region_toon_facing) X(tmnt_region_toon_facing_check)
+
+/* Declared by guest.h only in the exact-profile build; the runtime always defines them. */
+extern struct CPU *guest_prof_cpu;
+extern volatile uint32_t guest_prof_fn;
 
 typedef struct { const char *name; const void *addr; } code_import;
 #define IMPORT_ENTRY(name) { #name, (const void *)&name },

@@ -12,7 +12,7 @@ import tmnt_image as TI
 import trans as T
 from capstone import x86 as cx
 
-OUT = os.path.join(os.path.dirname(__file__), "out")
+OUT = os.environ.get("TMNT_RECOMP_OUT") or os.path.join(os.path.dirname(__file__), "out")   # the builder sets its own
 IMPOSSIBLE = {
     "aaa", "aas", "aam", "aad", "daa", "das", "into", "bound", "salc", "xlatb", "lds", "les", "arpl",
     "sysenter", "sysexit", "hlt", "in", "out", "insb", "insd", "outsb", "outsd", "iretd", "retf",

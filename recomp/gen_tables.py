@@ -6,7 +6,7 @@ import sys
 import pefile
 import tmnt_image as TI
 
-OUT = os.path.join(os.path.dirname(__file__), "out")
+OUT = os.environ.get("TMNT_RECOMP_OUT") or os.path.join(os.path.dirname(__file__), "out")   # the builder sets its own
 
 
 def main():

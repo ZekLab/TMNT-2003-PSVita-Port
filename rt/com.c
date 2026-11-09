@@ -44,6 +44,7 @@ uint32_t com_vtable(const char *iface, const com_method_info *info, int count, c
         snprintf(t->name, sizeof t->name, "%s::%s", iface, info[i].name);
         t->thunk.name = t->name;
         t->thunk.nargs = info[i].nargs;
+        t->thunk.serial = strncmp(iface, "IDirect3D", 9) == 0;
         t->thunk.fn = com_unimplemented;
         for (const com_impl *m = impls; m && m->name; m++)
             if (strcmp(m->name, info[i].name) == 0)

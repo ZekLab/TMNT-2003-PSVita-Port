@@ -684,6 +684,9 @@ static rt_thread_ctx *new_thread_ctx(uint32_t stack)
     return t;
 }
 
+/* A guest thread context for host-run guest work (the draw worker of game_tmnt.c): CPU, guest stack and TEB, known to the API layer. */
+CPU *rt_new_thread_cpu(uint32_t stack) { return &new_thread_ctx(stack)->cpu; }
+
 static uint32_t k_CreateThread(CPU *c)
 {
     uint32_t stack = ARG(1) ? ARG(1) : (1U << 20);

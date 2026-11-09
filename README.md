@@ -74,14 +74,15 @@ The VPK holds only the port's own code. The game's code is translated on your co
    ```
 
    The first folder is the installed game (the one with `TMNT_EN.EXE`). The script checks the executable, translates it
-   into `tmnt_code.so` and `image.bin`, and copies the game's data files next to them. It takes about a minute, plus the
-   time to copy 1.7 GB.
+   into `tmnt_code.so`, and copies it next to the executable and the game's data files. It takes about a minute, plus
+   the time to copy 1.7 GB.
 4. Create `ux0:data/TMNT2003/` on the Vita and copy everything in `vita_files` into it.
 5. Optional: copy the converted movies to `ux0:data/TMNT2003/movies/` (see [Movies](#movies)).
 6. Start the game from the LiveArea. If a file is missing, the game says which one.
 
-`tmnt_code.so` and `image.bin` must come from the same release as the VPK: after updating the VPK, run the script
-again.
+`tmnt_code.so` must come from a release that uses the same game code as the VPK; the release notes say when it has to
+be made again. The game lays out its memory image from `TMNT_EN.EXE` at start-up (an `image.bin` from older versions is
+still accepted when the executable is not there).
 
 ### Movies
 

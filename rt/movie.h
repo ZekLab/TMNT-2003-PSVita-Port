@@ -27,3 +27,6 @@ extern uint32_t movie_hw_w, movie_hw_h;
 extern volatile uint32_t movie_hw_bound_frame[MOVIE_HW_SLOTS];
 /* Once, on the main thread, after vitaGL starts; without converted movies (or on any error) the movies stay on pl_mpeg. */
 void movie_hw_init(void);
+
+/* Vita, TMNT_MOVIE_BENCH=1: measures what converting the movies on the console would cost (rt/movie_bench.c), then the app closes. */
+void movie_bench_run(void);

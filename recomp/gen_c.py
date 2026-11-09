@@ -7,7 +7,7 @@ import tmnt_image as TI
 import build_one as B
 from capstone import x86 as cx
 
-OUT = os.path.join(os.path.dirname(__file__), "out")
+OUT = os.environ.get("TMNT_RECOMP_OUT") or os.path.join(os.path.dirname(__file__), "out")   # the builder sets its own
 CHUNK = 200
 
 # Functions replaced by a hand-written body: RVA -> (reason, C statements). Each body must leave the guest stack as the original's `ret` would.
@@ -15,6 +15,7 @@ CHUNK = 200
 HOOKS = {
     0x011d93: "tmnt_hook_start_area",
     0x0047d7: "tmnt_hook_set_next_area",
+    0x12f4f0: "tmnt_hook_open_resource",   # archive file by id: a cleared stage's area panels in colour
     0x098466: "tmnt_hook_title",
     0x09e126: "tmnt_hook_pad_settings",
     0x0aca5f: "tmnt_hook_logic",
@@ -42,6 +43,16 @@ FASTPATHS = {
     0x0a64aa: "tmnt_fast_anim_curve",       # the game's animation curve (search + cubic): 14.4% of a logic tick
     0x0ef9f0: "tmnt_fast_hanim_attach",     # RpHAnim attach over the frame tree, every character every tick: ~8% of logic
     0x118cd0: "tmnt_fast_sphere_tri",       # sphere/triangle collision, early rejection only: ~6% of logic
+    0x0a0371: "tmnt_fast_stage_screen",     # the stage start screen's update: area choice on cleared stages
+    0x0ac135: "tmnt_fast_task_create",      # TMNT_TRACE_TASKS: logs each task the game creates (development)
+    0x0ac4db: "tmnt_fast_frame",            # the game's tick (logic, draw, task queue): the draw/logic pipeline when it is on
+    0x0acaa4: "tmnt_fast_draw_tasks_a",     # a view's task draw walks (loop 0x4ac90a): state 2 written without undoing the logic's
+    0x0acab0: "tmnt_fast_draw_tasks_b",
+    0x0ac6b6: "tmnt_fast_list_insert",      # draw-list and task-memory changes, queued while the pipeline's worker draws
+    0x0ac6e2: "tmnt_fast_list_remove",
+    0x0ac70b: "tmnt_fast_list_slot",
+    0x0ac8a7: "tmnt_fast_task_free",
+    0x0ac1d1: "tmnt_fast_task_destroy",
     0x0cc050: "tmnt_fast_rw_flush_states",  # RwD3D9 render/texture stage state flush: thousands of COM calls a frame in fights
     0x1593b0: "tmnt_fast_sfd_yuv_argb",     # Sofdec movie frame YUV -> ARGB: only SSE/MMX versions exist, so movies stayed black
     # Sofdec's own picture is no longer shown (pl_mpeg draws movies): its IDCT and motion compensation become no-ops, so the
@@ -52,6 +63,10 @@ FASTPATHS = {
     0x1873c0: "tmnt_fast_sfd_skip",
     0x187480: "tmnt_fast_sfd_skip",
 }
+
+# Globals the game's logic and draw both write (the current task, set by both task loops): with the draw/logic pipeline the draw
+# worker uses its own copy (rt/guest.h GUEST_PT). Found with the memtrace build (rt/memtrace.c).
+PER_THREAD_GLOBALS = (0x646d2c, 0x646d30)
 
 # False function entries whose decoding reads flags after a call (never executed): RVA -> reason. Skipped by the flag check.
 FLAG_CHECK_IGNORE = {
@@ -162,6 +177,8 @@ def main():
         L.extend(bodies)
         # Unchanged files keep their timestamps, so a rebuild only recompiles what changed (the Vita build takes ~10 minutes).
         path, text = os.path.join(cdir, "guest_%03d.c" % (n // CHUNK)), "\n".join(L) + "\n"
+        for a in PER_THREAD_GLOBALS:
+            text = text.replace("(uint32_t)(0x%xU)" % a, "GUEST_PT(c, 0x%xU)" % a)
         if not os.path.exists(path) or open(path).read() != text:
             with open(path, "w") as f:
                 f.write(text)

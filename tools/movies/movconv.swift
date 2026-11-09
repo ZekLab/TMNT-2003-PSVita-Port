@@ -484,6 +484,7 @@ func verify(file: String, dat: String, entry: Int) throws -> (Int, Double, Doubl
 
 // ----------------------------------------------------------------- main ---
 
+setvbuf(stdout, nil, _IOLBF, 0)   // a line per movie at once (the builder shows the progress)
 let args = CommandLine.arguments
 guard args.count >= 3 else {
     print("usage: movconv <game dir> <out dir> [V00_00 ...]")

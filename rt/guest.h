@@ -342,6 +342,12 @@ static inline void guest_prof_leave(guest_prof_frame *f) { if (f->c == guest_pro
 #define GUEST_ENTER(rva) do { if (__builtin_expect(guest_trace_on, 0)) guest_trace_enter(c, (rva)); } while (0)
 #endif
 
+/* Per-thread globals for the draw/logic pipeline (rt/game_tmnt.c): recomp/gen_c.py PER_THREAD_GLOBALS wraps their addresses, and
+ * the draw worker's CPU reads and writes its own copy, guest_pt_shift bytes away. */
+extern struct CPU *guest_pt_cpu;
+extern uint32_t guest_pt_shift;
+#define GUEST_PT(c, a) ((uint32_t)(a) + ((struct CPU *)(c) == guest_pt_cpu ? guest_pt_shift : 0U))
+
 /* TMNT: the image has no relocations and stays at 0x400000, so guest addresses are offsets into one host block. */
 extern uint8_t *guest_membase;
 #define G2H(a) ((void *)(guest_membase + (uint32_t)(a)))

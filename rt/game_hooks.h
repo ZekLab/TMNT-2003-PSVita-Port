@@ -7,6 +7,7 @@ struct CPU;
 /* StartArea(state, ?, area index) at 0x411d93 and SetNextArea(area index) at 0x4047d7: area checkpoints inside a stage. */
 void tmnt_hook_start_area(struct CPU *c);
 void tmnt_hook_set_next_area(struct CPU *c);
+void tmnt_hook_open_resource(struct CPU *c);
 
 /* Title screen update (0x498466, the "PRESS START" screen): tmnt_title_active() is true while the game runs it. */
 void tmnt_hook_title(struct CPU *c);
@@ -25,6 +26,16 @@ void tmnt_hook_skip_check(struct CPU *c);
 
 /* CRT _getptd (0x56abe9) fast path: the thread's data block straight from the emulated TLS slot when it exists. */
 int tmnt_fast_getptd(struct CPU *c);
+int tmnt_fast_frame(struct CPU *c);
+int tmnt_fast_task_create(struct CPU *c);
+int tmnt_fast_stage_screen(struct CPU *c);
+int tmnt_fast_draw_tasks_a(struct CPU *c);
+int tmnt_fast_draw_tasks_b(struct CPU *c);
+int tmnt_fast_list_insert(struct CPU *c);
+int tmnt_fast_list_remove(struct CPU *c);
+int tmnt_fast_list_slot(struct CPU *c);
+int tmnt_fast_task_free(struct CPU *c);
+int tmnt_fast_task_destroy(struct CPU *c);
 /* RpSkin skinning in native float: 4 bones (0x4f52f0), 2 bones (0x4f5960), one bone per mesh (0x4f5880); TMNT_HLE_CHECK=1 also
  * runs the translated body and compares. */
 int tmnt_fast_skin4(struct CPU *c);

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <zlib.h>
 
+#include "osdep.h"
 #include "plat.h"
 #include "runtime.h"
 
@@ -111,32 +112,49 @@ void plat_swap(void)
     SDL_GL_SwapWindow(window);
 }
 
-/* TMNT_KEYS="ms:dik:hold_ms,...": scripted key presses for headless runs (DIK codes in hex, times from start). */
-static void scripted_keys(void)
+/* TMNT_KEYS="ms:dik:hold_ms,...": scripted key presses for headless runs (DIK codes in hex, times from start). TMNT_KEYS_AREA, same
+ * form, counts from the start of the last area instead (game_tmnt.c), for dialogs and fights after a checkpoint resume. */
+typedef struct { uint32_t at, dik, hold; } scripted_key;
+
+static int parse_keys(const char *s, scripted_key *keys, int max)
 {
-    static struct { uint32_t at, dik, hold; } keys[64];
-    static int count = -1;
-    static uint64_t t0;
-    if (count < 0) {
-        count = 0;
-        t0 = plat_ticks_us();
-        const char *s = getenv("TMNT_KEYS");
-        while (s && *s && count < 64) {
-            char *e;
-            keys[count].at = (uint32_t)strtoul(s, &e, 10);
-            if (*e != ':') break;
-            keys[count].dik = (uint32_t)strtoul(e + 1, &e, 16);
-            keys[count].hold = 150;
-            if (*e == ':') keys[count].hold = (uint32_t)strtoul(e + 1, &e, 10);
-            count++;
-            s = *e == ',' ? e + 1 : e;
-        }
+    int count = 0;
+    while (s && *s && count < max) {
+        char *e;
+        keys[count].at = (uint32_t)strtoul(s, &e, 10);
+        if (*e != ':') break;
+        keys[count].dik = (uint32_t)strtoul(e + 1, &e, 16);
+        keys[count].hold = 150;
+        if (*e == ':') keys[count].hold = (uint32_t)strtoul(e + 1, &e, 10);
+        count++;
+        s = *e == ',' ? e + 1 : e;
     }
-    uint32_t now = (uint32_t)((plat_ticks_us() - t0) / 1000U);
+    return count;
+}
+
+static void play_keys(const scripted_key *keys, int count, uint32_t now)
+{
     for (int i = 0; i < count; i++) {
         if (now >= keys[i].at && now < keys[i].at + keys[i].hold) dik[keys[i].dik & 0xFF] = 0x80;
         else if (now >= keys[i].at + keys[i].hold && now < keys[i].at + keys[i].hold + 100) dik[keys[i].dik & 0xFF] = 0;
     }
+}
+
+extern uint64_t tmnt_area_started_us;
+
+static void scripted_keys(void)
+{
+    static scripted_key keys[64], area_keys[256];
+    static int count = -1, area_count;
+    static uint64_t t0;
+    if (count < 0) {
+        t0 = plat_ticks_us();
+        count = parse_keys(getenv("TMNT_KEYS"), keys, 64);
+        area_count = parse_keys(getenv("TMNT_KEYS_AREA"), area_keys, 256);
+    }
+    play_keys(keys, count, (uint32_t)((plat_ticks_us() - t0) / 1000U));
+    if (area_count && tmnt_area_started_us)   /* game_tmnt.c stamps the area with rt_now_us(), another clock than SDL's */
+        play_keys(area_keys, area_count, (uint32_t)((rt_now_us() - tmnt_area_started_us) / 1000U));
 }
 
 int plat_pump(void)

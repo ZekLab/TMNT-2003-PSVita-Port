@@ -10,6 +10,7 @@
 #include "dx_consts.h"
 #include "osdep.h"
 #include "plat.h"
+#include "settings.h"
 
 #define DS_OK 0U
 #define E_NOINTERFACE 0x80004002U
@@ -261,8 +262,9 @@ void dsound_mix(int16_t *out, int frames)
     pthread_mutex_unlock(&lock);
     static long clipped, mixed;
     static float peak;
+    const float master = (float)settings_value(SET_VOLUME) / 10.0f;   /* the menu's Sound volume */
     for (int i = 0; i < frames * 2; i++) {
-        float v = acc[i] * 32767.0f, a = fabsf(v);
+        float v = acc[i] * 32767.0f * master, a = fabsf(v);
         if (a > 32767.0f) clipped++;
         if (a > peak) peak = a;
         /* Soft limiter above 80% of full scale: loud fights bend smoothly into the ceiling instead of being cut off. */

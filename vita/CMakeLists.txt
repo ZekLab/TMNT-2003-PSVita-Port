@@ -15,6 +15,14 @@ set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(GEN "${ROOT}/recomp/out/c")
 # ON: the translated code is not in the VPK; it is loaded from tmnt_code.so, which the user makes with tools/make_vita_files.py.
 option(TMNT_CODE_SO "Load the translated code from tmnt_code.so" ON)
+# Development part of the in-game menu (rt/settings.h): ON for our builds, OFF for release VPKs (VitaDB).
+option(TMNT_DEV_MENU "Development items in the Select + Start menu" ON)
+# Exact profile (TMNT_PROF=1 per function, logic and draw apart): the runtime and tmnt_code.so both built with GUEST_PROF_EXCL.
+option(TMNT_PROF_EXCL "Exact-profile build" OFF)
+set(PROF_FLAGS)
+if (TMNT_PROF_EXCL)
+    set(PROF_FLAGS -DGUEST_PROF_EXCL)
+endif()
 if (NOT EXISTS "${GEN}/dispatch.c" AND NOT TMNT_CODE_SO)
     message(FATAL_ERROR "Missing generated C in ${GEN}; run recomp/gen_c.py and recomp/gen_tables.py first")
 endif()
@@ -22,7 +30,7 @@ endif()
 file(GLOB GUEST_SOURCES CONFIGURE_DEPENDS "${GEN}/guest_*.c")
 set(RT_SOURCES
     ${ROOT}/rt/runtime.c ${ROOT}/rt/win32.c ${ROOT}/rt/com.c ${ROOT}/rt/d3d9.c ${ROOT}/rt/d3d9_gl.c
-    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c ${ROOT}/rt/movie.c ${ROOT}/rt/par.c ${ROOT}/rt/code_so.c)
+    ${ROOT}/rt/plat_vita.c ${ROOT}/rt/dinput.c ${ROOT}/rt/dsound.c ${ROOT}/rt/game_tmnt.c ${ROOT}/rt/movie.c ${ROOT}/rt/movie_bench.c ${ROOT}/rt/par.c ${ROOT}/rt/code_so.c ${ROOT}/rt/pe_image.c ${ROOT}/rt/settings.c)
 
 set(COMMON_FLAGS -std=gnu11 -O2 -mtune=cortex-a9 -mfpu=neon -fno-strict-aliasing)
 
@@ -38,6 +46,12 @@ endif()
 add_executable(TMNTVita ${RT_SOURCES})
 target_compile_options(TMNTVita PRIVATE ${COMMON_FLAGS} -Wall -Wno-unused-function)
 target_compile_definitions(TMNTVita PRIVATE GUEST_GENERATED_STACK_GUARD=0)
+if (TMNT_PROF_EXCL)
+    target_compile_definitions(TMNTVita PRIVATE GUEST_PROF_EXCL)
+endif()
+if (TMNT_DEV_MENU)
+    target_compile_definitions(TMNTVita PRIVATE TMNT_DEV_MENU)
+endif()
 target_include_directories(TMNTVita PRIVATE ${ROOT}/rt)
 # vita-elf-create appends SCE data after the text segment; headroom avoids failures near a 64 KB boundary (Rogue Squadron).
 target_link_options(TMNTVita PRIVATE -Wl,--defsym=__sce_headroom=0x2000)
@@ -52,7 +66,7 @@ if (TMNT_CODE_SO)
     # The module for local testing (build/vita/tmnt_code.so), when the translated code is here; users make their own.
     if (EXISTS "${GEN}/dispatch.c")
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        add_custom_target(tmnt_code ALL COMMAND ${Python3_EXECUTABLE} ${ROOT}/tools/make_vita_files.py --code-only ${CMAKE_CURRENT_BINARY_DIR}
+        add_custom_target(tmnt_code ALL COMMAND ${Python3_EXECUTABLE} ${ROOT}/tools/make_vita_files.py --code-only ${CMAKE_CURRENT_BINARY_DIR} ${PROF_FLAGS}
             WORKING_DIRECTORY ${ROOT} VERBATIM)
     endif()
 else()
@@ -77,6 +91,8 @@ target_link_libraries(TMNTVita PRIVATE
     ScePower_stub
     SceSysmodule_stub
     SceVideodec_stub
+    SceJpeg_stub
+    SceJpegEnc_stub
     SceIofilemgr_stub
     stdc++
     pthread

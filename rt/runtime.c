@@ -18,12 +18,16 @@
 #include "osdep.h"
 #include "runtime.h"
 #include "par.h"
+#include "movie.h"
 #ifdef __vita__
+#include "pe_image.h"
 #include "plat.h"
 #endif
 
 uint8_t *guest_membase;
 uint32_t g_guest_fs_base_cached;
+struct CPU *guest_pt_cpu;   /* the pipeline's draw worker (game_tmnt.c), NULL when it is off */
+uint32_t guest_pt_shift;
 
 #ifdef TMNT_CODE_SO
 /* Vita: the translated code and its tables come from tmnt_code.so (code_so.c). */
@@ -494,6 +498,23 @@ void rt_thunk_call(CPU *__restrict c, uint32_t addr)
 #endif
         prof_thunk_us[i] += rt_now_us() - t0;
         prof_thunk_n[i]++;
+    } else if (t->serial && guest_pt_cpu) {
+        /* Draw pipeline on: the game thread (loading) and the draw worker both reach Direct3D; the layer behind it expects one. */
+        static pthread_mutex_t d3d_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+        if (c != guest_pt_cpu && getenv("TMNT_PIPE_TRACE")) {   /* which Direct3D calls the game thread makes while the worker draws */
+            static uint32_t n[RT_MAX_THUNKS];
+            static uint64_t last;
+            n[i]++;
+            uint64_t now = rt_now_us();
+            if (now - last > 2000000U) {
+                last = now;
+                for (uint32_t k = 0; k < thunk_count; k++)
+                    if (n[k]) { rt_log("[pipe] game thread called %s %u times\n", thunks[k]->name, n[k]); n[k] = 0; }
+            }
+        }
+        pthread_mutex_lock(&d3d_lock);
+        ret = t->fn(c);
+        pthread_mutex_unlock(&d3d_lock);
     } else {
         ret = t->fn(c);
     }
@@ -729,14 +750,39 @@ uint32_t rt_heap_live(void) { return (uint32_t)heap_live; }
 
 /* -------------------------------------------------------------- loader --- */
 
+static void bind_imports(void)
+{
+    for (uint32_t i = 0; i < guest_import_count; i++) {
+        const rt_thunk *t = rt_find_import(guest_import_slots[i].name);
+        st32(GUEST_IMAGE_BASE + guest_import_slots[i].slot_rva, rt_add_thunk(t));
+    }
+}
+
 static void load_image(const char *path)
 {
+#ifdef __vita__
+    /* The image is laid out from TMNT_EN.EXE itself when it is there; image.bin from older versions still works. */
+    FILE *exe = fopen("TMNT_EN.EXE", "rb");
+    if (exe) {
+        fclose(exe);
+        char err[256], msg[512];
+        if (!pe_image_load("TMNT_EN.EXE", guest_membase + GUEST_IMAGE_BASE, guest_image_size, guest_image_entry, err, sizeof err)) {
+            rt_log("[rt] %s\n", err);
+            snprintf(msg, sizeof msg, "TMNT_EN.EXE in ux0:data/TMNT2003/ cannot be used: %s.\n\n"
+                     "Copy TMNT_EN.EXE and tmnt_code.so again from the same run of tools/make_vita_files.py.", err);
+            plat_fatal(msg);
+        }
+        rt_log("[rt] image laid out from TMNT_EN.EXE\n");
+        bind_imports();
+        return;
+    }
+#endif
     FILE *f = fopen(path, "rb");
     if (!f) {
         rt_log("[rt] cannot open %s\n", path);
 #ifdef __vita__
-        plat_fatal("The game image (image.bin) is missing from ux0:data/TMNT2003/.\n\n"
-                   "Make it on your computer from your copy of the game with tools/make_vita_files.py (see the README), then copy it there.");
+        plat_fatal("The game's executable (TMNT_EN.EXE) is missing from ux0:data/TMNT2003/.\n\n"
+                   "Copy it there with the files made by tools/make_vita_files.py (see the README).");
 #endif
         exit(2);
     }
@@ -750,10 +796,7 @@ static void load_image(const char *path)
 #endif
         exit(2);
     }
-    for (uint32_t i = 0; i < guest_import_count; i++) {
-        const rt_thunk *t = rt_find_import(guest_import_slots[i].name);
-        st32(GUEST_IMAGE_BASE + guest_import_slots[i].slot_rva, rt_add_thunk(t));
-    }
+    bind_imports();
 }
 
 static void init_teb(CPU *c)
@@ -920,6 +963,10 @@ int main(void)
     rt_log("[vita] cwd %s, clocks arm %d gpu %d MHz\n", getcwd(cwd, sizeof cwd) ? cwd : "?", scePowerGetArmClockFrequency(),
            scePowerGetGpuClockFrequency());
     load_env_file();
+    if (getenv("TMNT_MOVIE_BENCH") && atoi(getenv("TMNT_MOVIE_BENCH"))) {
+        movie_bench_run();
+        return 0;
+    }
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, VITA_GAME_STACK);

@@ -7,7 +7,7 @@
 #include "guest.h"
 
 #define TMNT_CODE_MAGIC 0x434d4e54U   /* "TNMC" */
-#define TMNT_CODE_VERSION 1
+#define TMNT_CODE_VERSION 2   /* 2: per-thread globals (GUEST_PT) for the draw pipeline */
 
 typedef struct { uint32_t slot_rva; const char *name; } guest_import_slot;
 
