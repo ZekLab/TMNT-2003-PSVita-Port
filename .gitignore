@@ -3,7 +3,7 @@
 /installer/
 /recomp/out/
 /build/
-# Local tools and references (see INSTALLED.md and README.md).
+# Local tools and references (see README.md).
 /wineprefix/
 /tools/wine/
 /ref/

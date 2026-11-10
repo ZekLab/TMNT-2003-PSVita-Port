@@ -186,7 +186,7 @@ Open an issue with:
 - `tools/`: `make_vita_files.py` (the user's translation step, with its headers in `tools/vita_code/`), table
   generators, the movie converter (`tools/movies/`), the LiveArea builder and run scripts.
 - `vita/`: the Vita build (`CMakeLists.txt`, LiveArea template).
-- `docs/`: inventory of the executable and the progress log (in Romanian).
+- `docs/screenshots/`: captures from the Vita.
 
 ## Legal notice
 
