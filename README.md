@@ -61,6 +61,18 @@ discs use SecuROM 4, so their executables are different and do not work.
 The VPK holds only the port's own code. The game's code is translated on your computer from your `TMNT_EN.EXE` into
 `tmnt_code.so`, which the VPK loads at start-up.
 
+**On a Mac, the easy way is the builder app.** Each release has `TMNT2003-Vita-Builder-Mac-AppleSilicon.zip` (M1 and
+newer) and `TMNT2003-Vita-Builder-Mac-Intel.zip`:
+
+1. Install `TMNTVita.vpk` from the release with VitaShell.
+2. Unzip the builder for your Mac and open it. If macOS refuses to open it, right-click it and choose Open.
+3. Set "Game folder" to the installed PC game (the folder with `TMNT_EN.EXE`), pick an "Output folder", and press Build.
+   It checks the executable, makes `tmnt_code.so`, converts the 18 movies and copies the game data. It takes a few
+   minutes, plus the time to copy 1.7 GB, and nothing leaves your computer.
+4. Create `ux0:data/TMNT2003/` on the Vita and copy everything in the output folder into it.
+
+Otherwise, do the same by hand:
+
 1. From the [Releases](../../releases) page, download `TMNTVita.vpk` and the source code of the same release
    (`Source code (zip)`), and unzip the source code. Install the VPK with VitaShell.
 2. Install the tools on your computer:
