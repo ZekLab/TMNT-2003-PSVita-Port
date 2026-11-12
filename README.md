@@ -178,6 +178,7 @@ Optional settings go in `ux0:data/TMNT2003/tmnt_env.txt`, one `NAME=value` per l
 | `TMNT_ASPECT` | stretched | `4:3` keeps the original shape with black bars. |
 | `TMNT_AUDIO` | 1 | `0` turns the sound off. |
 | `TMNT_VOLUME` | 10 | Sound volume, `0` to `10`. |
+| `TMNT_STAGE_PICK` | 0 | `1` lets you pick the area on the start screen of a cleared stage. |
 | `TMNT_CHECKPOINTS` | 1 | `0` starts every stage from its first area instead of its checkpoint. |
 | `TMNT_PERF` | 0 | `1` writes frame times and per-thread CPU use to `log.txt` every few seconds. |
 | `TMNT_RENDER_THREAD` | 1 | `0` draws on the game thread, as in older versions. |
@@ -192,6 +193,7 @@ Press Select + Start during the game to open the port's own menu. Changes are sa
 | 30 FPS lock | Same as `TMNT_FPS_LOCK`. |
 | Sound volume | Same as `TMNT_VOLUME`. |
 | Substage Checkpoint | Same as `TMNT_CHECKPOINTS`. On: a stage starts from the area where you left off. Off: from its first area. |
+| Stage area choice | Same as `TMNT_STAGE_PICK`. On: on the start screen of a cleared stage, left and right pick the area. Off: the game's own screen. |
 | Start area | Picks the area where the next stage starts, among the areas you have already reached. It is used once, then it goes back to Checkpoint. It is not saved. |
 
 ## Reporting issues
