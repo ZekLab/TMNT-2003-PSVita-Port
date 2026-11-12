@@ -119,7 +119,7 @@ const char *tmnt_area_choice_name(int k) { return k >= 0 && k < choice_count ? c
 /* Where a stage started from its first area begins: the area chosen in the menu if it is in this stage, else its checkpoint. */
 static uint32_t stage_start_area(uint32_t stage)
 {
-    if (stage == 0 || stage >= MAX_STAGES || getenv("TMNT_NO_CHECKPOINTS")) return 0;
+    if (stage == 0 || stage >= MAX_STAGES || !settings_value(SET_CHECKPOINTS)) return 0;
     if (!loaded) load_checkpoints();
     int k = settings_value(SET_START_AREA);
     if (k > 0 && k <= tmnt_area_choice_count() && area_stage(choices[k - 1]) == stage) return choices[k - 1];
@@ -159,7 +159,7 @@ void tmnt_hook_start_area(CPU *c)
     uint32_t origin = next_area_origin;
     next_area_origin = 0;
     uint32_t idx = ld32(c->esp + 8);
-    if (idx == 0 || idx >= MAX_AREAS || getenv("TMNT_NO_CHECKPOINTS")) return;
+    if (idx == 0 || idx >= MAX_AREAS || !settings_value(SET_CHECKPOINTS)) return;
     uint32_t stage = area_stage(idx), area = area_number(idx);
     rt_log("[checkpoint] StartArea(%u: stage %u area %u %s), origin %08x\n", idx, stage, area, area_name(idx), origin);
     tmnt_area_started_us = rt_now_us();

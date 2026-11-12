@@ -19,6 +19,7 @@ typedef struct {
 static setting items[SET_COUNT] = {
     [SET_FPS_LOCK] = { "TMNT_FPS_LOCK", "30 FPS lock", 1, 2, 0, { "Off", "On" }, { "0", "1" } },
     [SET_VOLUME] = { "TMNT_VOLUME", "Sound volume", 10, 11, 0, NUMBERS, NUMBERS },
+    [SET_CHECKPOINTS] = { "TMNT_CHECKPOINTS", "Substage Checkpoint", 1, 2, 0, { "Off", "On" }, { "0", "1" } },
     [SET_START_AREA] = { NULL, "Start area", 0, 0, 0, { "Checkpoint" }, { "" } },   /* list from game_tmnt.c, not saved */
     [SET_PIPELINE] = { "TMNT_PIPELINE", "Pipeline (test)", 0, 2, 0, { "Off", "On" }, { "0", "1" } },
 };
@@ -34,6 +35,7 @@ static void load(void)
     const char *e;
     if ((e = getenv("TMNT_FPS_LOCK")) && *e) items[SET_FPS_LOCK].value = atoi(e) ? 1 : 0;
     if ((e = getenv("TMNT_PIPELINE")) && *e) items[SET_PIPELINE].value = atoi(e) ? 1 : 0;
+    if ((e = getenv("TMNT_CHECKPOINTS")) && *e) items[SET_CHECKPOINTS].value = atoi(e) ? 1 : 0;
     if ((e = getenv("TMNT_START_AREA")) && *e) items[SET_START_AREA].value = atoi(e);   /* scripted tests: position in the area list */
     if ((e = getenv("TMNT_VOLUME")) && *e) {
         int v = atoi(e);
@@ -88,8 +90,8 @@ static void save(void)
     fclose(f);
     remove(ENV_FILE);
     if (rename(ENV_FILE ".tmp", ENV_FILE) != 0) rt_log("[settings] cannot replace %s\n", ENV_FILE);
-    else rt_log("[settings] saved: fps lock %d, volume %d, pipeline %d\n", items[SET_FPS_LOCK].value, items[SET_VOLUME].value,
-                items[SET_PIPELINE].value);
+    else rt_log("[settings] saved: fps lock %d, volume %d, checkpoints %d, pipeline %d\n", items[SET_FPS_LOCK].value,
+                items[SET_VOLUME].value, items[SET_CHECKPOINTS].value, items[SET_PIPELINE].value);
 out:
     for (int i = 0; i < n; i++) free(lines[i]);
 }
