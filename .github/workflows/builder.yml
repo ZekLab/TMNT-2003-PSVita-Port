@@ -24,7 +24,7 @@ jobs:
             zig: x86_64-windows
             zig_sha256: 554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c
             asset: TMNT2003-Vita-Builder-Windows.zip
-          - os: macos-14
+          - os: macos-15
             zig: aarch64-macos
             zig_sha256: 39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa
             asset: TMNT2003-Vita-Builder-Mac-AppleSilicon.zip
