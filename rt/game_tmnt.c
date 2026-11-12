@@ -688,6 +688,10 @@ int tmnt_fast_stage_screen(CPU *c)
     static int trace = -1, in_body, confirmed;
     static uint32_t last_state = 0xffffffffU, prev_buttons, prev_left, prev_right;
     if (in_body) return 0;
+    if (!settings_value(SET_STAGE_PICK)) {   /* option off: the game's own screen, no area choice */
+        tmnt_stage_choice_hint = 0;
+        return 0;
+    }
     if (trace < 0) trace = getenv("TMNT_TRACE_TASKS") && atoi(getenv("TMNT_TRACE_TASKS"));
     uint32_t scr = ld32(STAGE_SCREEN_PTR), gs = ld32(GAME_STATE_PTR);
     if (!scr || !gs) return 0;
