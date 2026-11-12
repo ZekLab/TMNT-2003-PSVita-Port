@@ -101,7 +101,7 @@ target_link_libraries(TMNTVita PRIVATE
 
 # ---- SELF + VPK ----
 set(VITA_TITLEID "TMNT02003")
-set(VITA_VERSION "00.03")
+set(VITA_VERSION "00.04")
 # ATTRIBUTE2=12: extended memory budget for the app.
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
