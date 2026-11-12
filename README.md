@@ -165,9 +165,22 @@ Optional settings go in `ux0:data/TMNT2003/tmnt_env.txt`, one `NAME=value` per l
 | `TMNT_FPS_LOCK` | 1 | Keeps levels at 30 FPS: the game slows down slightly in the heaviest moments instead of skipping frames. `0` lets it skip frames as on the PC. |
 | `TMNT_ASPECT` | stretched | `4:3` keeps the original shape with black bars. |
 | `TMNT_AUDIO` | 1 | `0` turns the sound off. |
+| `TMNT_VOLUME` | 10 | Sound volume, `0` to `10`. |
+| `TMNT_CHECKPOINTS` | 1 | `0` starts every stage from its first area instead of its checkpoint. |
 | `TMNT_PERF` | 0 | `1` writes frame times and per-thread CPU use to `log.txt` every few seconds. |
 | `TMNT_RENDER_THREAD` | 1 | `0` draws on the game thread, as in older versions. |
 | `TMNT_PAR` | 2 | Helper threads for skinning and cel shading: `0` none, `1` one. |
+
+### In-game menu
+
+Press Select + Start during the game to open the port's own menu. Changes are saved to `tmnt_env.txt` by themselves.
+
+| Option | What it does |
+| --- | --- |
+| 30 FPS lock | Same as `TMNT_FPS_LOCK`. |
+| Sound volume | Same as `TMNT_VOLUME`. |
+| Substage Checkpoint | Same as `TMNT_CHECKPOINTS`. On: a stage starts from the area where you left off. Off: from its first area. |
+| Start area | Picks the area where the next stage starts, among the areas you have already reached. It is used once, then it goes back to Checkpoint. It is not saved. |
 
 ## Reporting issues
 
